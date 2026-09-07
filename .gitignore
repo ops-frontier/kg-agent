@@ -4,5 +4,7 @@ __pycache__/
 .venv/
 dist/
 *.egg-info/
+node_modules/
 
 knowledge/
+neo4j-data/

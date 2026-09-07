@@ -3,6 +3,8 @@ import json
 import threading
 from http.server import ThreadingHTTPServer
 
+from neo4j.exceptions import ServiceUnavailable
+
 from kg_collector import web
 
 
@@ -32,40 +34,49 @@ def test_status_stream_sends_initial_and_updated_state() -> None:
         web.update_collection_state(**original_state)
 
 
-def test_page_uses_event_source_without_interval_polling() -> None:
-    assert "new EventSource('/api/status')" in web.PAGE
-    assert "setInterval(" not in web.PAGE
+def test_graph_data_reads_from_neo4j_store(monkeypatch) -> None:
+    class Store:
+        def graph_data(self, owner, repository):
+            return {"nodes": [{"id": f"{owner}/{repository}:run", "name": "run", "calls": []}]}
 
-
-def test_page_routes_repository_views_with_browser_history() -> None:
-    assert "history.pushState" in web.PAGE
-    assert "addEventListener('popstate',route)" in web.PAGE
-    assert "new URLSearchParams(location.search).get('repository')" in web.PAGE
-    assert "if(!selected&&repos[0])" not in web.PAGE
-
-
-def test_page_uses_sans_serif_text_and_monospace_identifiers() -> None:
-    assert "font-family:'Noto Sans JP','Yu Gothic',sans-serif" in web.PAGE
-    assert ".identifier,.node-file{font-family:ui-monospace" in web.PAGE
-    assert '<b class="identifier">${n.name}</b>' in web.PAGE
-    assert '<span class="identifier">${r.repository}</span>' in web.PAGE
-
-
-def test_graph_data_does_not_expand_ambiguous_function_names(tmp_path, monkeypatch) -> None:
-    root = tmp_path / "owner" / "demo" / "code"
-    root.mkdir(parents=True)
-    for file_name in ("a.py", "b.py"):
-        (root / f"{file_name}.yaml").write_text(
-            f"path: {file_name}\nfunctions:\n  - name: shared\n    calls: []\n",
-            encoding="utf-8",
-        )
-    (root / "caller.py.yaml").write_text(
-        "path: caller.py\nfunctions:\n  - name: run\n    calls: [shared]\n",
-        encoding="utf-8",
-    )
-    monkeypatch.setattr(web, "OUTPUT_DIR", tmp_path)
     monkeypatch.setattr(web, "OWNER", "owner")
+    monkeypatch.setattr(web, "graph_store", lambda: Store())
 
-    nodes = {node["id"]: node for node in web.graph_data("demo")["nodes"]}
+    assert web.graph_data("demo") == {"nodes": [{"id": "owner/demo:run", "name": "run", "calls": []}]}
 
-    assert nodes["caller.py::run"]["calls"] == ["external::shared"]
+
+def test_root_does_not_serve_a_web_ui() -> None:
+    server = ThreadingHTTPServer(("127.0.0.1", 0), web.Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    connection = http.client.HTTPConnection(*server.server_address)
+
+    try:
+        connection.request("GET", "/")
+        assert connection.getresponse().status == 404
+    finally:
+        connection.close()
+        server.shutdown()
+        server.server_close()
+
+
+def test_database_failure_returns_service_unavailable(monkeypatch) -> None:
+    class Store:
+        def repositories(self, owner):
+            raise ServiceUnavailable("database unavailable")
+
+    monkeypatch.setattr(web, "graph_store", lambda: Store())
+    server = ThreadingHTTPServer(("127.0.0.1", 0), web.Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    connection = http.client.HTTPConnection(*server.server_address)
+
+    try:
+        connection.request("GET", "/api/repositories")
+        response = connection.getresponse()
+        assert response.status == 503
+        assert json.load(response)["error"] == "Neo4j is unavailable"
+    finally:
+        connection.close()
+        server.shutdown()
+        server.server_close()

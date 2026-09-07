@@ -11,8 +11,10 @@ COPY src/ ./src/
 
 RUN python -m pip install --no-cache-dir .
 
-ENV KG_OUTPUT_DIR=/knowledge
-ENV PORT=8080
-EXPOSE 8080
+ENV PORT=8081
+ENV NEO4J_URI=bolt://neo4j:7687
+ENV NEO4J_USER=neo4j
+ENV NEO4J_PASSWORD=kgpassword
+EXPOSE 8081
 
 ENTRYPOINT ["python", "-m", "kg_collector.web"]

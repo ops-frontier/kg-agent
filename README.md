@@ -135,11 +135,19 @@ GHCRへのログインには `GITHUB_TOKEN` を使用する。トークンには
 
 # 構成
 
-収集ツールはDockerイメージ内で動作し、ナレッジグラフをコンテナ内の `/knowledge` にYAMLおよびMarkdownとして作成する。`Dockerfile` はツールのインストールまでを行い、ナレッジグラフ自体は含めない。
+`docker-compose.yml` で次の3サービスを起動する。
 
-devcontainerはDocker-in-Dockerを提供する。devcontainerをrebuildしたあと、内部からDockerイメージのbuild、run、commit、pushを実行できる。
+* `neo4j`: ナレッジグラフを永続化する。
+* `kg-collector`: GitHub API、Tree-sitter、Manifest解析を実行し、収集ジョブと参照用のHTTP APIを提供する。Web UIは持たない。
+* `kg-agent`: React SPAをPythonサーバで配信し、`kg-collector` APIへのプロキシとAIチャットAPIを提供する。
 
-## ステップ1収集ツール
+`kg-collector` は抽出した情報をYAMLファイルへ保存せず、最初からNeo4jへノードとエッジとして登録する。`kg-agent` の画面状態はブラウザヒストリで管理され、リポジトリ詳細URLやチャットURLへ直接アクセスできる。現時点のAIチャットはモックで、入力に対して「未実装です」と応答する。認証機能は設けていない。
+
+Neo4j のデータは Codespaces 内の `./neo4j-data` を `/data` にバインドマウントして永続化する。このディレクトリは `.gitignore` と `.dockerignore` の対象であり、Gitには含めない。
+
+devcontainerはDocker-in-Dockerを提供する。devcontainerをrebuildしたあと、内部から `docker compose` を実行できる。
+
+## ステップ1〜3収集ツール
 
 `kg-collect` は `GH_PAT` を使って `GH_TARGET_ORGANIZATION` のリポジトリを列挙し、次の情報を並列収集します。
 
@@ -147,110 +155,78 @@ devcontainerはDocker-in-Dockerを提供する。devcontainerをrebuildしたあ
 * Tree-sitter: 関数、クラス、変数、import、関数内の呼び出し
 * Manifest: `package.json`、`pyproject.toml`、`pom.xml` の依存関係
 
-### イメージのbuildとWeb UI
+収集結果はNeo4jへ次のように登録する。
 
-収集ツールのイメージをbuildする。
+* `Repository`, `File`, `Function`, `Class`, `Commit`, `PullRequest`, `Issue`, `User`, `Manifest`, `Dependency` ノードを作成する。
+* `CONTAINS`, `DEFINES`, `CALLS`, `HAS_COMMIT`, `HAS_PULL_REQUEST`, `HAS_ISSUE`, `AUTHORED`, `HAS_MANIFEST`, `DECLARES`, `DEPENDS_ON`, `FIXES` エッジを作成する。
+* `updatedAt`, `pushedAt`, デフォルトブランチの先頭コミットOIDが一致するリポジトリはcloneと解析を省略し、変更されたリポジトリだけを置き換える。
 
-```bash
-docker build -t kg-collector:latest .
-```
+### docker compose による起動
 
-ホスト側で環境変数を設定し、コンテナを名前付きで起動する。コンテナ起動時に Web UI が `8080` ポートで開始される。Codespaces のポート転送で `8080` を開いて閲覧する。`-e` に値を書かないことで、ホストの値をコンテナへ継承する。
+ホスト側で環境変数を設定する。`NEO4J_PASSWORD` を省略した場合は `kgpassword` を使う。
 
 ```bash
 export GH_PAT=<read-only PAT>
 export GH_TARGET_ORGANIZATION=<organization>
-
-docker run --name kg-collector-run \
-	-p 8080:8080 \
-	-e GH_PAT \
-	-e GH_TARGET_ORGANIZATION \
-	kg-collector:latest
+export NEO4J_PASSWORD=<neo4j password>
 ```
 
-Web UI 上部の「ナレッジグラフ収集」ボタンを押すと収集がバックグラウンドで開始される。サイドバーの「依存関係探索」では、収集済みリポジトリの Call Graph を表示する。木の各項目は初期状態で折りたたまれており、項目をクリックすると下位の呼び出しを展開できる。認証は行わず、Codespaces のポート転送経由で利用する。
+Neo4j、収集API、kg-agent Web UIを起動する。
 
 ```bash
-# Codespaces の Ports ビューで 8080 を転送する
+docker compose up --build
 ```
 
-GitHub GraphQL APIの1回の取得上限に合わせ、コミット、Pull Request、Issueはそれぞれ直近100件を保存する。件数はイメージ名の後ろに `--history-limit 20` のように指定して変更でき、総件数は各YAMLの `total_count` に残る。
+Codespaces の Ports ビューでは通常 `8080` だけを転送して利用する。その他のポートは、各サービスへ直接接続してデバッグする場合に限り転送する。
 
-### ナレッジグラフを含むイメージの作成とpush
+* `8080`: kg-agent のWeb UI
+* `8081`: kg-collector のAPI（直接デバッグ用）
+* `7474`: Neo4j HTTP API（直接デバッグ用）
+* `7687`: Neo4j Bolt接続（直接デバッグ用）
 
-収集コンテナの終了後、`/knowledge` を含む新しいイメージを作成する。起動時に渡したPATをイメージ設定へ残さないよう、commit時に認証用環境変数を空へ上書きする。
+Codespaces の Ports ビューで `8080` を開いて kg-agent を利用する。収集管理画面では収集状況と対象リポジトリを確認し、収集をバックグラウンドで開始できる。リポジトリ詳細には先頭コミットID、最終コミット日時、ノード数、Call Graphを表示する。AIチャット画面は入力に対してモック応答を返す。
+
+`kg-collector` は次の認証なしAPIを提供する。
+
+* `POST /api/collect`: 収集ジョブを開始する。
+* `GET /api/status`: 収集状況をServer-Sent Eventsで配信する。
+* `GET /api/repositories`: 収集済みリポジトリの一覧を返す。
+* `GET /api/repositories/{name}`: リポジトリ情報とノード数を返す。
+* `GET /api/graph/{name}`: Call Graphを返す。
+
+GitHub GraphQL APIの1回の取得上限に合わせ、コミット、Pull Request、Issueはそれぞれ直近100件を保存する。件数は `kg-collector` コンテナ内で `kg-collect --history-limit 20` のように指定して変更できる。
+
+### Neo4j の確認
+
+Neo4j Browser は kg-agent Web UI のサイドバーから開く。接続先は自動設定される。手動で接続する場合、Codespacesでは `bolt+s://<8080番の転送URLのホスト名>:443`、ローカルでは `bolt://localhost:8080` を指定する。ユーザー名は `neo4j`、パスワードは `NEO4J_PASSWORD` で指定した値を使用する。Codespacesで転送が必要なポートは `8080` のみで、`7474` と `7687` をブラウザ向けに転送する必要はない。
+
+登録状況はCypherで確認できる。
+
+```cypher
+MATCH (r:Repository)
+RETURN r.full_name, r.source_files, r.functions, r.dependencies
+ORDER BY r.full_name
+```
+
+関数呼び出しの影響範囲は次のように検索できる。
+
+```cypher
+MATCH (target:Function {name: "validate_card"})<-[:CALLS*1..3]-(caller:Function)<-[:DEFINES]-(f:File)<-[:CONTAINS]-(r:Repository)
+RETURN r.full_name, f.path, caller.name
+```
+
+### 差分更新
+
+再度「ナレッジグラフ収集」を実行すると、Neo4j上の `Repository` ノードとGitHub上のリポジトリ情報を比較する。`updatedAt`、`pushedAt`、デフォルトブランチの先頭コミットOIDが一致するリポジトリはcloneと解析を省略し、変更されたリポジトリだけを置き換える。
+
+Neo4jのデータを破棄して作り直す場合は、サービスを停止して `./neo4j-data` を削除する。
 
 ```bash
-export GHCR_OWNER=<push先のGitHub userまたはorganization>
-export KG_IMAGE="ghcr.io/${GHCR_OWNER}/knowledge-graph:latest"
-
-docker commit \
-	--change 'ENV GH_PAT=' \
-	--change 'ENV GH_TARGET_ORGANIZATION=' \
-	kg-collector-run "${KG_IMAGE}"
-
-echo "${GITHUB_TOKEN}" | docker login ghcr.io \
-	--username "${GITHUB_ACTOR}" \
-	--password-stdin
-docker push "${KG_IMAGE}"
+docker compose down
+rm -rf neo4j-data
 ```
 
-push後は収集コンテナを削除できる。
-
-```bash
-docker rm kg-collector-run
-```
-
-### 既存ナレッジグラフの差分更新
-
-commit済みイメージから起動すると、既存の `/knowledge` とGitHub上のリポジトリ情報を比較する。`updatedAt`、`pushedAt`、デフォルトブランチの先頭コミットOIDが一致するリポジトリはcloneと解析を省略し、変更されたリポジトリだけを置き換える。
-
-```bash
-docker pull "${KG_IMAGE}"
-docker run --name kg-collector-update \
-	-e GH_PAT \
-	-e GH_TARGET_ORGANIZATION \
-	"${KG_IMAGE}"
-
-docker commit \
-	--change 'ENV GH_PAT=' \
-	--change 'ENV GH_TARGET_ORGANIZATION=' \
-	kg-collector-update "${KG_IMAGE}"
-docker push "${KG_IMAGE}"
-docker rm kg-collector-update
-```
-
-収集を実行せずナレッジグラフだけを取り出す場合は、一時コンテナから `/knowledge` をコピーする。
-
-```bash
-docker create --name kg-export "${KG_IMAGE}"
-docker cp kg-export:/knowledge ./knowledge
-docker rm kg-export
-```
-
-### 出力構造
-
-解析結果はソースのディレクトリ構造を保って保存します。
-
-```text
-knowledge/
-└── <organization>/
-	├── index.yaml
-	└── <repository>/
-		├── SUMMARY.md
-		├── repository.yaml
-		├── github/
-		│   ├── commits.yaml
-		│   ├── contributors.yaml
-		│   ├── issues.yaml
-		│   └── pull_requests.yaml
-		├── dependencies/
-		│   └── manifests.yaml
-		└── code/
-			└── <source path>.yaml
-```
-
-各ファイルは `schema_version` を持ち、途中で一部リポジトリの取得に失敗した場合も `index.yaml` にエラーを記録して残りの収集を継続します。生成前に対象リポジトリの古い出力を置き換えるため、削除されたソースの解析結果は残りません。
+途中で一部リポジトリの取得に失敗した場合も、収集ステータスにエラーを記録して残りの収集を継続する。生成前に対象リポジトリの古いノードを置き換えるため、削除されたソースの解析結果は残らない。
 
 開発時のテストは次のコマンドで実行する。
 
@@ -258,3 +234,5 @@ knowledge/
 python -m pip install -e '.[dev]'
 python -m pytest -q
 ```
+
+React SPAだけを開発する場合は `kg_agent` ディレクトリで `npm install` と `npm run dev` を実行する。本番用SPAは `kg-agent` イメージのビルド時に生成される。

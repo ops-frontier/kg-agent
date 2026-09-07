@@ -1,46 +1,99 @@
-from pathlib import Path
-
-import yaml
-
 from kg_collector.cli import repository_is_current
-from kg_collector.storage import write_repository, write_yaml
+from kg_collector.storage import (
+    Neo4jGraphStore,
+    call_edge_resolutions,
+    clean_properties,
+    repository_payload,
+)
 
 
-def test_write_repository_uses_source_directory_hierarchy(tmp_path: Path) -> None:
+def test_repository_payload_models_files_symbols_and_dependencies() -> None:
     github_data = {
         "repository": {"name": "demo", "nameWithOwner": "owner/demo", "default_branch": "main"},
-        "commits": {"total_count": 1, "items": [{}]},
+        "commits": {"total_count": 1, "items": [{"oid": "abc", "messageHeadline": "fixes #7", "author": {"name": "Ada", "email": "ada@example.com", "user": {"login": "ada"}}, "associatedPullRequests": []}]},
         "pull_requests": {"total_count": 0, "items": []},
-        "issues": {"total_count": 0, "items": []},
+        "issues": {"total_count": 1, "items": [{"number": 7, "title": "Bug", "author": {"login": "ada"}, "labels": []}]},
         "contributors": [],
     }
     source_data = [{
         "schema_version": 1, "path": "src/api/app.py", "language": "python",
-        "parse_has_error": False, "classes": [], "functions": [], "variables": [], "imports": [],
+        "parse_has_error": False, "classes": [],
+        "functions": [{"name": "run", "kind": "function_definition", "start_line": 3, "end_line": 4, "calls": ["send"]}],
+        "variables": [], "imports": ["from client import send"],
     }]
+    manifests = [{"path": "pyproject.toml", "type": "pyproject.toml", "dependencies": [{"name": "lib", "version": "*", "scope": "dependencies", "repository_dependency": "lib"}]}]
 
-    write_repository(tmp_path, github_data, source_data, [])
+    payload = repository_payload("owner", github_data, source_data, manifests)
 
-    code_file = tmp_path / "code" / "src" / "api" / "app.py.yaml"
-    assert yaml.safe_load(code_file.read_text(encoding="utf-8"))["path"] == "src/api/app.py"
-    assert (tmp_path / "github" / "commits.yaml").exists()
-    assert (tmp_path / "dependencies" / "manifests.yaml").exists()
-    assert (tmp_path / "SUMMARY.md").exists()
+    assert payload["repository"]["full_name"] == "owner/demo"
+    assert payload["files"][0]["id"] == "owner/demo:src/api/app.py"
+    assert payload["functions"][0]["calls"] == ["send"]
+    assert payload["repository_dependencies"] == [{"source": "owner/demo", "target": "owner/lib"}]
+    assert payload["fixes"] == [{"commit_id": "owner/demo:commit:abc", "issue_id": "owner/demo:issue:7"}]
 
 
-def test_repository_is_current_compares_repository_fingerprint(tmp_path: Path) -> None:
-    write_yaml(tmp_path / "repository.yaml", {
-        "schema_version": 1,
-        "updatedAt": "2026-09-01T00:00:00Z",
-        "pushedAt": "2026-08-31T00:00:00Z",
-        "head_oid": "abc123",
-    })
+def test_repository_is_current_uses_store_fingerprint() -> None:
+    class Store:
+        def __init__(self) -> None:
+            self.current = True
+
+        def repository_is_current(self, repository):
+            return self.current
+
+    store = Store()
     repository = {
         "updatedAt": "2026-09-01T00:00:00Z",
         "pushedAt": "2026-08-31T00:00:00Z",
         "defaultBranchRef": {"target": {"oid": "abc123"}},
     }
 
-    assert repository_is_current(tmp_path, repository)
-    repository["defaultBranchRef"]["target"]["oid"] = "def456"
-    assert not repository_is_current(tmp_path, repository)
+    assert repository_is_current(store, repository)
+    store.current = False
+    assert not repository_is_current(store, repository)
+
+
+def test_clean_properties_serializes_nested_values() -> None:
+    assert clean_properties({"name": "demo", "nested": {"x": 1}, "empty": None}) == {
+        "name": "demo",
+        "nested_json": '{"x": 1}',
+    }
+
+
+def test_graph_store_configures_transaction_retry(monkeypatch) -> None:
+    captured = {}
+
+    class Driver:
+        def close(self):
+            pass
+
+    def create_driver(uri, **options):
+        captured.update({"uri": uri, **options})
+        return Driver()
+
+    monkeypatch.setattr("kg_collector.storage.GraphDatabase.driver", create_driver)
+
+    store = Neo4jGraphStore(
+        "bolt://neo4j:7687",
+        "neo4j",
+        "password",
+        transaction_retry_seconds=120,
+    )
+    store.close()
+
+    assert captured["max_transaction_retry_time"] == 120
+
+
+def test_call_edges_are_grouped_by_source_repository() -> None:
+    functions = [
+        {"id": "owner/a:a.py:1:run", "owner": "owner", "repository": "owner/a", "file": "a.py", "name": "run", "calls": ["shared", "missing"], "external": False},
+        {"id": "owner/b:b.py:1:shared", "owner": "owner", "repository": "owner/b", "file": "b.py", "name": "shared", "calls": [], "external": False},
+    ]
+
+    resolutions = call_edge_resolutions("owner", functions)
+
+    assert set(resolutions) == {"owner/a", "owner/b"}
+    assert resolutions["owner/a"]["edges"] == [
+        {"source": "owner/a:a.py:1:run", "target": "owner/b:b.py:1:shared"},
+        {"source": "owner/a:a.py:1:run", "target": "owner/a::external::missing"},
+    ]
+    assert set(resolutions["owner/a"]["external_nodes"]) == {"owner/a::external::missing"}

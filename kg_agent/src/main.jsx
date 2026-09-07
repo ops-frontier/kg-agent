@@ -185,7 +185,11 @@ function App() {
   return (
     <div className="app-shell">
       <aside>
-        <button className="brand" onClick={() => navigate('/')}><CircleDot size={25} /><span>kg-agent</span></button>
+        <button className="brand" onClick={() => navigate('/')}>
+          <img className="brand-logo" src="/ops-frontier-logo-white.svg" alt="Ops Frontier" />
+          <img className="brand-mark" src="/favicon.ico" alt="" />
+          <span>ナレッジグラフツール</span>
+        </button>
         <nav>
           <button className={route.page !== 'chat' ? 'active' : ''} onClick={() => navigate('/')}><Network size={19} />収集管理</button>
           <button className={route.page === 'chat' ? 'active' : ''} onClick={() => navigate('/chat')}><MessageSquareText size={19} />AIチャット</button>

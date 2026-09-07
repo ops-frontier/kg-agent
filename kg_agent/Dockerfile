@@ -2,6 +2,7 @@ FROM node:22-bookworm AS frontend
 
 WORKDIR /build
 COPY package.json package-lock.json vite.config.js index.html ./
+COPY public/ ./public/
 COPY src/ ./src/
 RUN npm ci && npm run build
 

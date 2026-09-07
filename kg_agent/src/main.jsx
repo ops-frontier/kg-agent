@@ -147,22 +147,51 @@ function Repository({ name }) {
 function Chat() {
   const [input, setInput] = useState('')
   const [messages, setMessages] = useState([{ role: 'agent', text: 'ナレッジグラフについて質問してください。' }])
+  const [loading, setLoading] = useState(false)
   const submit = async (event) => {
     event.preventDefault()
-    if (!input.trim()) return
+    if (!input.trim() || loading) return
     const question = input.trim()
     setInput('')
     setMessages((items) => [...items, { role: 'user', text: question }])
-    const response = await api('/api/chat', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ message: question }) })
-    setMessages((items) => [...items, { role: 'agent', text: response.message }])
+    setLoading(true)
+    try {
+      const response = await api('/api/chat', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ message: question }) })
+      setMessages((items) => [...items, { role: 'agent', text: response.message, sources: response.sources || [] }])
+    } catch (reason) {
+      setMessages((items) => [...items, { role: 'error', text: reason.message }])
+    } finally {
+      setLoading(false)
+    }
   }
   return (
     <main className="chat-page">
-      <header className="page-header"><div><p className="kicker">KNOWLEDGE ASSISTANT</p><h1>AIエージェント</h1><p className="lead">Vertex AI 連携予定</p></div><Bot size={38} /></header>
-      <div className="conversation">{messages.map((message, index) => <div className={`message ${message.role}`} key={index}>{message.text}</div>)}</div>
+      <header className="page-header"><div><p className="kicker">KNOWLEDGE ASSISTANT</p><h1>AIエージェント</h1><p className="lead">Vertex AI + Neo4j GraphRAG</p></div><Bot size={38} /></header>
+      <div className="conversation" aria-live="polite">
+        {messages.map((message, index) => (
+          <div className={`message ${message.role}`} key={index}>
+            <div className="message-text">{message.text}</div>
+            {message.sources?.length > 0 && (
+              <details className="evidence">
+                <summary>Neo4j 根拠 {message.sources.length}件</summary>
+                <div className="evidence-list">{message.sources.map((source, sourceIndex) => (
+                  <div className="evidence-row" key={`${source.repository}:${source.file}:${source.function}:${sourceIndex}`}>
+                    <GitBranch size={15} />
+                    <span>
+                      <strong>{source.repository}</strong>
+                      <code>{source.file}{source.function ? `:${source.line || '?'} · ${source.function} · 距離 ${source.depth}` : ''}</code>
+                    </span>
+                  </div>
+                ))}</div>
+              </details>
+            )}
+          </div>
+        ))}
+        {loading && <div className="message agent pending"><LoaderCircle size={18} />Neo4j を検索して回答を生成中</div>}
+      </div>
       <form className="composer" onSubmit={submit}>
-        <input value={input} onChange={(event) => setInput(event.target.value)} placeholder="メッセージを入力" aria-label="メッセージ" />
-        <button type="submit" title="送信"><Send size={19} /></button>
+        <input value={input} onChange={(event) => setInput(event.target.value)} placeholder="例: repository-a の process_order を変更した際の影響範囲は？" aria-label="メッセージ" disabled={loading} />
+        <button type="submit" title="送信" disabled={loading || !input.trim()}><Send size={19} /></button>
       </form>
     </main>
   )

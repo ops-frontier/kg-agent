@@ -39,6 +39,7 @@ VARIABLE_TYPES = {
 }
 CALL_TYPES = {"call", "call_expression", "invocation_expression"}
 PARSER_LOCK = Lock()
+SOURCE_SCHEMA_VERSION = 2
 
 
 def iter_source_files(root: Path, max_file_bytes: int) -> Iterator[tuple[Path, str]]:
@@ -65,7 +66,7 @@ def analyze_file_isolated(path: Path, root: Path, language: str) -> dict[str, An
     if process.returncode == 0:
         return json.loads(process.stdout)
     return {
-        "schema_version": 1,
+        "schema_version": SOURCE_SCHEMA_VERSION,
         "path": path.relative_to(root).as_posix(),
         "language": language,
         "parse_has_error": True,
@@ -98,7 +99,7 @@ def _analyze_file(path: Path, root: Path, language: str) -> dict[str, Any]:
                 variables.append({"name": node_text(name_node, source, 200), "line": node.start_point.row + 1})
 
     return {
-        "schema_version": 1,
+        "schema_version": SOURCE_SCHEMA_VERSION,
         "path": path.relative_to(root).as_posix(),
         "language": language,
         "parse_has_error": tree.root_node.has_error,
@@ -118,7 +119,11 @@ def walk(root: Node) -> Iterator[Node]:
 
 
 def symbol(node: Node, source: bytes, include_calls: bool = False) -> dict[str, Any]:
-    name_node = node.child_by_field_name("name")
+    name_node = (
+        function_name_node(node)
+        if node.type == "arrow_function"
+        else node.child_by_field_name("name")
+    )
     result: dict[str, Any] = {
         "name": node_text(name_node, source, 200) if name_node else "<anonymous>",
         "kind": node.type,
@@ -134,7 +139,41 @@ def symbol(node: Node, source: bytes, include_calls: bool = False) -> dict[str, 
             }
             - {""}
         )
+        result["references"] = sorted(
+            {
+                node_text(descendant, source, 200)
+                for descendant in walk(node)
+                if is_function_reference(descendant)
+            }
+        )
     return result
+
+
+def function_name_node(node: Node) -> Node | None:
+    current = node.parent
+    while current is not None:
+        if current.type == "variable_declarator":
+            return current.child_by_field_name("name")
+        if current.type in FUNCTION_TYPES or current.type in CALL_TYPES:
+            return None
+        current = current.parent
+    return None
+
+
+def is_function_reference(node: Node) -> bool:
+    if node.type != "identifier" or node.parent is None:
+        return False
+    parent = node.parent
+    for index, child in enumerate(parent.children):
+        if child.id != node.id:
+            continue
+        field = parent.field_name_for_child(index)
+        if field in {"name", "pattern"}:
+            return False
+        if parent.type in CALL_TYPES and field in {"function", "name"}:
+            return False
+        return True
+    return False
 
 
 def call_name(node: Node, source: bytes) -> str:

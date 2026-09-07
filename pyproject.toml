@@ -8,6 +8,7 @@ version = "0.1.0"
 description = "Collect GitHub metadata, source structure, and dependencies into Neo4j"
 requires-python = ">=3.11"
 dependencies = [
+  "google-auth[requests]>=2.40,<3",
   "neo4j>=5.26,<6",
   "tree-sitter>=0.25.2,<0.26",
   "tree-sitter-language-pack>=0.9.0,<1",

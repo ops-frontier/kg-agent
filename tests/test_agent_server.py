@@ -28,7 +28,13 @@ class Neo4jStubHandler(BaseHTTPRequestHandler):
         return
 
 
-def test_chat_returns_mock_response(tmp_path) -> None:
+def test_chat_returns_graphrag_response(monkeypatch, tmp_path) -> None:
+    class StubAgent:
+        def answer(self, question):
+            assert question == "影響範囲は？"
+            return {"message": "呼び出し元が影響を受けます", "sources": [{"function": "caller"}]}
+
+    monkeypatch.setattr(agent_server, "get_agent", lambda: StubAgent())
     server = start_server(tmp_path)
     connection = http.client.HTTPConnection(*server.server_address)
     try:
@@ -36,7 +42,10 @@ def test_chat_returns_mock_response(tmp_path) -> None:
         connection.request("POST", "/api/chat", body, {"Content-Type": "application/json"})
         response = connection.getresponse()
         assert response.status == 200
-        assert json.load(response) == {"message": "未実装です"}
+        assert json.load(response) == {
+            "message": "呼び出し元が影響を受けます",
+            "sources": [{"function": "caller"}],
+        }
     finally:
         connection.close()
         server.shutdown()

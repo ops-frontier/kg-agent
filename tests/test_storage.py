@@ -5,6 +5,7 @@ from kg_collector.storage import (
     clean_properties,
     repository_payload,
 )
+from kg_collector.source import SOURCE_SCHEMA_VERSION
 
 
 def test_repository_payload_models_files_symbols_and_dependencies() -> None:
@@ -26,6 +27,7 @@ def test_repository_payload_models_files_symbols_and_dependencies() -> None:
     payload = repository_payload("owner", github_data, source_data, manifests)
 
     assert payload["repository"]["full_name"] == "owner/demo"
+    assert payload["repository"]["source_schema_version"] == SOURCE_SCHEMA_VERSION
     assert payload["files"][0]["id"] == "owner/demo:src/api/app.py"
     assert payload["functions"][0]["calls"] == ["send"]
     assert payload["repository_dependencies"] == [{"source": "owner/demo", "target": "owner/lib"}]
@@ -85,8 +87,8 @@ def test_graph_store_configures_transaction_retry(monkeypatch) -> None:
 
 def test_call_edges_are_grouped_by_source_repository() -> None:
     functions = [
-        {"id": "owner/a:a.py:1:run", "owner": "owner", "repository": "owner/a", "file": "a.py", "name": "run", "calls": ["shared", "missing"], "external": False},
-        {"id": "owner/b:b.py:1:shared", "owner": "owner", "repository": "owner/b", "file": "b.py", "name": "shared", "calls": [], "external": False},
+        {"id": "owner/a:a.py:1:run", "owner": "owner", "repository": "owner/a", "file": "a.py", "name": "run", "calls": ["shared", "missing"], "references": ["shared"], "external": False},
+        {"id": "owner/b:b.py:1:shared", "owner": "owner", "repository": "owner/b", "file": "b.py", "name": "shared", "calls": [], "references": [], "external": False},
     ]
 
     resolutions = call_edge_resolutions("owner", functions)
@@ -97,3 +99,6 @@ def test_call_edges_are_grouped_by_source_repository() -> None:
         {"source": "owner/a:a.py:1:run", "target": "owner/a::external::missing"},
     ]
     assert set(resolutions["owner/a"]["external_nodes"]) == {"owner/a::external::missing"}
+    assert resolutions["owner/a"]["reference_edges"] == [
+        {"source": "owner/a:a.py:1:run", "target": "owner/b:b.py:1:shared"},
+    ]

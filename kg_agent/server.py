@@ -13,11 +13,24 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
+try:
+    from .graphrag import GraphRAGAgent
+except ImportError:
+    from graphrag import GraphRAGAgent
+
 COLLECTOR_URL = os.environ.get("COLLECTOR_URL", "http://kg-collector:8081").rstrip("/")
 NEO4J_URL = os.environ.get("NEO4J_URL", "http://neo4j:7474").rstrip("/")
 NEO4J_BOLT_HOST = os.environ.get("NEO4J_BOLT_HOST", "neo4j")
 NEO4J_BOLT_PORT = int(os.environ.get("NEO4J_BOLT_PORT", "7687"))
 STATIC_DIR = Path(os.environ.get("STATIC_DIR", Path(__file__).parent / "dist"))
+_agent: GraphRAGAgent | None = None
+
+
+def get_agent() -> GraphRAGAgent:
+    global _agent
+    if _agent is None:
+        _agent = GraphRAGAgent.from_env()
+    return _agent
 
 
 class Handler(SimpleHTTPRequestHandler):
@@ -114,16 +127,31 @@ class Handler(SimpleHTTPRequestHandler):
     def do_POST(self) -> None:
         path = urlparse(self.path).path
         if path == "/api/chat":
-            content_length = int(self.headers.get("Content-Length", "0"))
-            if content_length:
-                self.rfile.read(content_length)
-            self.send_json({"message": "未実装です"})
+            self.chat()
         elif path == "/api/collect":
             self.proxy()
         elif path.startswith("/neo4j/"):
             self.proxy_neo4j()
         else:
             self.send_error(HTTPStatus.NOT_FOUND)
+
+    def chat(self) -> None:
+        content_length = int(self.headers.get("Content-Length", "0"))
+        if content_length <= 0 or content_length > 16_384:
+            self.send_json({"error": "質問を入力してください"}, HTTPStatus.BAD_REQUEST)
+            return
+        try:
+            payload = json.loads(self.rfile.read(content_length))
+            message = payload.get("message", "").strip()
+            if not message:
+                raise ValueError
+        except (json.JSONDecodeError, AttributeError, ValueError):
+            self.send_json({"error": "message を含むJSONを送信してください"}, HTTPStatus.BAD_REQUEST)
+            return
+        try:
+            self.send_json(get_agent().answer(message))
+        except Exception as error:
+            self.send_json({"error": str(error)}, HTTPStatus.BAD_GATEWAY)
 
     def log_message(self, format: str, *args: object) -> None:
         return

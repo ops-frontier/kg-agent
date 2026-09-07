@@ -7,6 +7,8 @@ import time
 from typing import Any, Iterable
 
 from neo4j import GraphDatabase
+
+from .source import SOURCE_SCHEMA_VERSION
 from neo4j.exceptions import Neo4jError, ServiceUnavailable
 
 
@@ -94,6 +96,7 @@ class Neo4jGraphStore:
                 "updatedAt": repository.get("updatedAt"),
                 "pushedAt": repository.get("pushedAt"),
                 "head_oid": target.get("oid"),
+                "source_schema_version": SOURCE_SCHEMA_VERSION,
             }.items()
         )
 
@@ -136,6 +139,12 @@ class Neo4jGraphStore:
                     session.execute_write(
                         _write_call_edges_tx,
                         edges[start:start + CALL_EDGE_BATCH_SIZE],
+                    )
+                reference_edges = resolution["reference_edges"]
+                for start in range(0, len(reference_edges), CALL_EDGE_BATCH_SIZE):
+                    session.execute_write(
+                        _write_reference_edges_tx,
+                        reference_edges[start:start + CALL_EDGE_BATCH_SIZE],
                     )
 
     def write_collection_index(self, owner: str, index: dict[str, Any]) -> None:
@@ -233,8 +242,10 @@ class Neo4jGraphStore:
                 """
                 MATCH (:Repository {full_name: $full_name})-[:CONTAINS]->(:File)-[:DEFINES]->(fn:Function)
                 OPTIONAL MATCH (fn)-[:CALLS]->(target:Function)
+                  WITH fn, collect(DISTINCT target.id) AS calls
+                  OPTIONAL MATCH (fn)-[:REFERENCES]->(referenced:Function)
                 RETURN fn.id AS id, fn.name AS name, fn.file AS file, fn.start_line AS line,
-                       collect(target.id) AS calls
+                      calls, collect(DISTINCT referenced.id) AS references
                 ORDER BY fn.file, fn.start_line, fn.name
                 """,
                 full_name=full_name,
@@ -255,6 +266,7 @@ def repository_payload(
         "owner": owner,
         "repository": full_name,
         "full_name": full_name,
+        "source_schema_version": SOURCE_SCHEMA_VERSION,
         "source_files": len(source_data),
         "functions": sum(len(item["functions"]) for item in source_data),
         "classes": sum(len(item["classes"]) for item in source_data),
@@ -457,7 +469,8 @@ def _repository_fingerprint_tx(tx: Any, full_name: str) -> Any:
     return tx.run(
         """
         MATCH (r:Repository {full_name: $full_name})
-        RETURN r.updatedAt AS updatedAt, r.pushedAt AS pushedAt, r.head_oid AS head_oid
+         RETURN r.updatedAt AS updatedAt, r.pushedAt AS pushedAt, r.head_oid AS head_oid,
+             r.source_schema_version AS source_schema_version
         """,
         full_name=full_name,
     ).single()
@@ -480,7 +493,8 @@ def _read_functions_tx(tx: Any, owner: str) -> list[dict[str, Any]]:
         """
         MATCH (fn:Function {owner: $owner})
         RETURN fn.id AS id, fn.repository AS repository, fn.file AS file,
-               fn.name AS name, fn.calls AS calls, coalesce(fn.external, false) AS external
+             fn.name AS name, fn.calls AS calls, fn.references AS references,
+             coalesce(fn.external, false) AS external
         """,
         owner=owner,
     )
@@ -661,7 +675,7 @@ def call_edge_resolutions(
     for function in internal:
         resolution = result.setdefault(
             function["repository"],
-            {"external_nodes": {}, "edges": []},
+            {"external_nodes": {}, "edges": [], "reference_edges": []},
         )
         for called_name in function.get("calls") or []:
             local_targets = by_file_and_name.get((function["repository"], function["file"], called_name), [])
@@ -684,12 +698,23 @@ def call_edge_resolutions(
                 {"source": function["id"], "target": target_id}
                 for target_id in target_ids
             )
+        for referenced_name in function.get("references") or []:
+            local_targets = by_file_and_name.get(
+                (function["repository"], function["file"], referenced_name),
+                [],
+            )
+            global_targets = by_name.get(referenced_name, [])
+            target_ids = local_targets or (global_targets if len(global_targets) == 1 else [])
+            resolution["reference_edges"].extend(
+                {"source": function["id"], "target": target_id}
+                for target_id in target_ids
+            )
     return result
 
 
 def _clear_call_edges_tx(tx: Any, owner: str, repository: str) -> None:
     tx.run(
-        "MATCH (fn:Function {owner: $owner, repository: $repository})-[r:CALLS]->() DELETE r",
+        "MATCH (fn:Function {owner: $owner, repository: $repository})-[r:CALLS|REFERENCES]->() DELETE r",
         owner=owner,
         repository=repository,
     ).consume()
@@ -718,6 +743,18 @@ def _write_call_edges_tx(tx: Any, edges: list[dict[str, str]]) -> None:
         MATCH (source:Function {id: item.source})
         MATCH (target:Function {id: item.target})
         MERGE (source)-[:CALLS]->(target)
+        """,
+        edges=edges,
+    ).consume()
+
+
+def _write_reference_edges_tx(tx: Any, edges: list[dict[str, str]]) -> None:
+    tx.run(
+        """
+        UNWIND $edges AS item
+        MATCH (source:Function {id: item.source})
+        MATCH (target:Function {id: item.target})
+        MERGE (source)-[:REFERENCES]->(target)
         """,
         edges=edges,
     ).consume()

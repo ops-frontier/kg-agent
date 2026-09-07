@@ -68,6 +68,7 @@ GitHubの多数のリポジトリからナレッジグラフを構築するに�
 * `(:Repository)-[:CONTAINS]->(:File)`
 * `(:File)-[:DEFINES]->(:Function)`
 * `(:Function)-[:CALLS]->(:Function)` （クロスリポジトリ含む）
+* `(:Function)-[:REFERENCES]->(:Function)` （コールバックやJSX propsとしての参照）
 * `(:User)-[:AUTHORED]->(:Commit)-[:MODIFIED]->(:File)`
 * `(:Commit)-[:FIXES]->(:Issue)`
 * `(:Repository)-[:DEPENDS_ON]->(:Repository)`
@@ -141,9 +142,9 @@ GHCRへのログインには `GITHUB_TOKEN` を使用する。トークンには
 * `kg-collector`: GitHub API、Tree-sitter、Manifest解析を実行し、収集ジョブと参照用のHTTP APIを提供する。Web UIは持たない。
 * `kg-agent`: React SPAをPythonサーバで配信し、`kg-collector` APIへのプロキシとAIチャットAPIを提供する。
 
-`kg-collector` は抽出した情報をYAMLファイルへ保存せず、最初からNeo4jへノードとエッジとして登録する。`kg-agent` の画面状態はブラウザヒストリで管理され、リポジトリ詳細URLやチャットURLへ直接アクセスできる。現時点のAIチャットはモックで、入力に対して「未実装です」と応答する。認証機能は設けていない。
+`kg-collector` は抽出した情報をYAMLファイルへ保存せず、最初からNeo4jへノードとエッジとして登録する。`kg-agent` の画面状態はブラウザヒストリで管理され、リポジトリ詳細URLやチャットURLへ直接アクセスできる。AIチャットは質問中の関数をNeo4jで照合し、逆向きの `CALLS` 関係を最大5段検索した結果をVertex AIへ渡して回答を生成する。認証機能は設けていない。
 
-Neo4j のデータは Codespaces 内の `./neo4j-data` を `/data` にバインドマウントして永続化する。このディレクトリは `.gitignore` と `.dockerignore` の対象であり、Gitには含めない。
+Neo4j のデータは Docker の named volume `neo4j-data` を `/data` にマウントして永続化する。
 
 devcontainerはDocker-in-Dockerを提供する。devcontainerをrebuildしたあと、内部から `docker compose` を実行できる。
 
@@ -158,7 +159,7 @@ devcontainerはDocker-in-Dockerを提供する。devcontainerをrebuildしたあ
 収集結果はNeo4jへ次のように登録する。
 
 * `Repository`, `File`, `Function`, `Class`, `Commit`, `PullRequest`, `Issue`, `User`, `Manifest`, `Dependency` ノードを作成する。
-* `CONTAINS`, `DEFINES`, `CALLS`, `HAS_COMMIT`, `HAS_PULL_REQUEST`, `HAS_ISSUE`, `AUTHORED`, `HAS_MANIFEST`, `DECLARES`, `DEPENDS_ON`, `FIXES` エッジを作成する。
+* `CONTAINS`, `DEFINES`, `CALLS`, `REFERENCES`, `HAS_COMMIT`, `HAS_PULL_REQUEST`, `HAS_ISSUE`, `AUTHORED`, `HAS_MANIFEST`, `DECLARES`, `DEPENDS_ON`, `FIXES` エッジを作成する。
 * `updatedAt`, `pushedAt`, デフォルトブランチの先頭コミットOIDが一致するリポジトリはcloneと解析を省略し、変更されたリポジトリだけを置き換える。
 
 ### docker compose による起動
@@ -169,6 +170,16 @@ devcontainerはDocker-in-Dockerを提供する。devcontainerをrebuildしたあ
 export GH_PAT=<read-only PAT>
 export GH_TARGET_ORGANIZATION=<organization>
 export NEO4J_PASSWORD=<neo4j password>
+export GCP_SA_KEY_JSON="$(cat /path/to/service-account.json)"
+```
+
+サービスアカウントには対象Google Cloudプロジェクトの `Vertex AI ユーザー`（`roles/aiplatform.user`）ロールを付与し、Vertex AI APIを有効化する。認証JSONはファイルやイメージへ保存せず、`GCP_SA_KEY_JSON` からコンテナ起動時に渡す。プロジェクトIDは認証JSONの `project_id` を使用するが、別プロジェクトを利用する場合は `GCP_PROJECT_ID` で上書きできる。
+
+モデルとリージョンは必要に応じて変更できる。
+
+```bash
+export GCP_LOCATION=asia-northeast1
+export GCP_MODEL=gemini-2.5-flash
 ```
 
 Neo4j、収集API、kg-agent Web UIを起動する。
@@ -184,7 +195,7 @@ Codespaces の Ports ビューでは通常 `8080` だけを転送して利用す
 * `7474`: Neo4j HTTP API（直接デバッグ用）
 * `7687`: Neo4j Bolt接続（直接デバッグ用）
 
-Codespaces の Ports ビューで `8080` を開いて kg-agent を利用する。収集管理画面では収集状況と対象リポジトリを確認し、収集をバックグラウンドで開始できる。リポジトリ詳細には先頭コミットID、最終コミット日時、ノード数、Call Graphを表示する。AIチャット画面は入力に対してモック応答を返す。
+Codespaces の Ports ビューで `8080` を開いて kg-agent を利用する。収集管理画面では収集状況と対象リポジトリを確認し、収集をバックグラウンドで開始できる。リポジトリ詳細には先頭コミットID、最終コミット日時、ノード数、Call Graphを表示する。AIチャット画面では「`repository-a` の `process_order` を変更した際の影響範囲は？」のように質問でき、回答とNeo4j上の根拠を確認できる。
 
 `kg-collector` は次の認証なしAPIを提供する。
 
@@ -219,11 +230,10 @@ RETURN r.full_name, f.path, caller.name
 
 再度「ナレッジグラフ収集」を実行すると、Neo4j上の `Repository` ノードとGitHub上のリポジトリ情報を比較する。`updatedAt`、`pushedAt`、デフォルトブランチの先頭コミットOIDが一致するリポジトリはcloneと解析を省略し、変更されたリポジトリだけを置き換える。
 
-Neo4jのデータを破棄して作り直す場合は、サービスを停止して `./neo4j-data` を削除する。
+Neo4jのデータを破棄して作り直す場合は、サービスと named volume を削除する。
 
 ```bash
-docker compose down
-rm -rf neo4j-data
+docker compose down --volumes
 ```
 
 途中で一部リポジトリの取得に失敗した場合も、収集ステータスにエラーを記録して残りの収集を継続する。生成前に対象リポジトリの古いノードを置き換えるため、削除されたソースの解析結果は残らない。

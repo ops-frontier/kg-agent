@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+import posixpath
 from pathlib import Path
+import re
 import subprocess
 import sys
 from threading import Lock
@@ -39,7 +41,8 @@ VARIABLE_TYPES = {
 }
 CALL_TYPES = {"call", "call_expression", "invocation_expression"}
 PARSER_LOCK = Lock()
-SOURCE_SCHEMA_VERSION = 2
+SOURCE_SCHEMA_VERSION = 3
+MODULE_EXTENSIONS = (".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs")
 
 
 def iter_source_files(root: Path, max_file_bytes: int) -> Iterator[tuple[Path, str]]:
@@ -75,6 +78,7 @@ def analyze_file_isolated(path: Path, root: Path, language: str) -> dict[str, An
         "functions": [],
         "variables": [],
         "imports": [],
+        "import_modules": [],
     }
 
 
@@ -84,6 +88,7 @@ def _analyze_file(path: Path, root: Path, language: str) -> dict[str, Any]:
     functions = []
     classes = []
     imports = []
+    import_modules = []
     variables = []
 
     for node in walk(tree.root_node):
@@ -93,6 +98,9 @@ def _analyze_file(path: Path, root: Path, language: str) -> dict[str, Any]:
             classes.append(symbol(node, source))
         elif node.type in IMPORT_TYPES:
             imports.append(node_text(node, source, 500))
+            source_node = node.child_by_field_name("source")
+            if language in {"javascript", "typescript", "tsx"} and source_node is not None:
+                import_modules.append(node_text(source_node, source, 500).strip("'\""))
         elif node.type in VARIABLE_TYPES:
             name_node = node.child_by_field_name("name") or node.child_by_field_name("left")
             if name_node is not None:
@@ -107,7 +115,107 @@ def _analyze_file(path: Path, root: Path, language: str) -> dict[str, Any]:
         "functions": functions,
         "variables": variables,
         "imports": imports,
+        "import_modules": import_modules,
     }
+
+
+def resolve_file_imports(root: Path, source_data: list[dict[str, Any]]) -> None:
+    known_paths = {item["path"] for item in source_data}
+    configs = load_module_configs(root)
+    for item in source_data:
+        resolved = []
+        for module in item.get("import_modules", []):
+            target = resolve_module_path(item["path"], module, known_paths, configs)
+            if target is not None and target not in resolved:
+                resolved.append(target)
+        item["resolved_imports"] = resolved
+
+
+def resolve_module_path(
+    source_path: str,
+    module: str,
+    known_paths: set[str],
+    configs: list[tuple[str, str, dict[str, list[str]]]],
+) -> str | None:
+    source_directory = posixpath.dirname(source_path)
+    bases = []
+    if module.startswith("."):
+        bases.append(posixpath.normpath(posixpath.join(source_directory, module)))
+    else:
+        for config_directory, base_url, paths in configs:
+            if not path_is_within(source_path, config_directory):
+                continue
+            for pattern, targets in paths.items():
+                wildcard = match_alias(pattern, module)
+                if wildcard is None:
+                    continue
+                for target in targets:
+                    mapped = target.replace("*", wildcard)
+                    bases.append(posixpath.normpath(posixpath.join(config_directory, base_url, mapped)))
+        if module.startswith("@/"):
+            source_parts = source_path.split("/")
+            if "src" in source_parts:
+                src_index = len(source_parts) - 1 - source_parts[::-1].index("src")
+                bases.append("/".join(source_parts[:src_index + 1] + [module[2:]]))
+    for base in bases:
+        for candidate in module_candidates(base):
+            if candidate in known_paths:
+                return candidate
+    return None
+
+
+def module_candidates(base: str) -> Iterator[str]:
+    yield base
+    if not posixpath.splitext(base)[1]:
+        for extension in MODULE_EXTENSIONS:
+            yield f"{base}{extension}"
+        for extension in MODULE_EXTENSIONS:
+            yield f"{base}/index{extension}"
+
+
+def load_module_configs(root: Path) -> list[tuple[str, str, dict[str, list[str]]]]:
+    configs = []
+    for path in root.rglob("*"):
+        if path.name not in {"tsconfig.json", "jsconfig.json"} or "node_modules" in path.parts:
+            continue
+        try:
+            data = json.loads(strip_json_comments(path.read_text(encoding="utf-8")))
+        except (OSError, json.JSONDecodeError):
+            continue
+        options = data.get("compilerOptions") or {}
+        paths = options.get("paths") or {}
+        if not isinstance(paths, dict):
+            continue
+        relative_directory = path.parent.relative_to(root).as_posix()
+        configs.append((
+            "" if relative_directory == "." else relative_directory,
+            str(options.get("baseUrl", ".")),
+            {
+                pattern: [target for target in targets if isinstance(target, str)]
+                for pattern, targets in paths.items()
+                if isinstance(pattern, str) and isinstance(targets, list)
+            },
+        ))
+    return sorted(configs, key=lambda item: len(item[0]), reverse=True)
+
+
+def strip_json_comments(value: str) -> str:
+    value = re.sub(r"/\*.*?\*/", "", value, flags=re.DOTALL)
+    value = re.sub(r"(^|\s)//.*$", r"\1", value, flags=re.MULTILINE)
+    return re.sub(r",\s*([}\]])", r"\1", value)
+
+
+def match_alias(pattern: str, module: str) -> str | None:
+    if "*" not in pattern:
+        return "" if pattern == module else None
+    prefix, suffix = pattern.split("*", 1)
+    if module.startswith(prefix) and module.endswith(suffix):
+        return module[len(prefix):len(module) - len(suffix) if suffix else None]
+    return None
+
+
+def path_is_within(path: str, directory: str) -> bool:
+    return not directory or path == directory or path.startswith(f"{directory}/")
 
 
 def walk(root: Node) -> Iterator[Node]:

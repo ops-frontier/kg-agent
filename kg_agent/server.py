@@ -23,6 +23,8 @@ NEO4J_URL = os.environ.get("NEO4J_URL", "http://neo4j:7474").rstrip("/")
 NEO4J_BOLT_HOST = os.environ.get("NEO4J_BOLT_HOST", "neo4j")
 NEO4J_BOLT_PORT = int(os.environ.get("NEO4J_BOLT_PORT", "7687"))
 STATIC_DIR = Path(os.environ.get("STATIC_DIR", Path(__file__).parent / "dist"))
+MAX_CHAT_HISTORY = 20
+MAX_CHAT_MESSAGE_LENGTH = 8_000
 _agent: GraphRAGAgent | None = None
 
 
@@ -45,6 +47,12 @@ class Handler(SimpleHTTPRequestHandler):
         self.wfile.write(body)
 
     def proxy(self, base_url: str = COLLECTOR_URL, path: str | None = None) -> None:
+        try:
+            self._proxy(base_url, path)
+        except (BrokenPipeError, ConnectionResetError):
+            self.close_connection = True
+
+    def _proxy(self, base_url: str, path: str | None) -> None:
         body = None
         content_length = int(self.headers.get("Content-Length", "0"))
         if content_length:
@@ -137,7 +145,7 @@ class Handler(SimpleHTTPRequestHandler):
 
     def chat(self) -> None:
         content_length = int(self.headers.get("Content-Length", "0"))
-        if content_length <= 0 or content_length > 16_384:
+        if content_length <= 0 or content_length > 200_000:
             self.send_json({"error": "質問を入力してください"}, HTTPStatus.BAD_REQUEST)
             return
         try:
@@ -148,13 +156,47 @@ class Handler(SimpleHTTPRequestHandler):
         except (json.JSONDecodeError, AttributeError, ValueError):
             self.send_json({"error": "message を含むJSONを送信してください"}, HTTPStatus.BAD_REQUEST)
             return
+        history = normalize_chat_history(payload.get("history"))
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", "application/x-ndjson; charset=utf-8")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Connection", "close")
+        self.end_headers()
+        self.close_connection = True
+
+        def send_event(event: dict[str, Any]) -> None:
+            self.wfile.write((json.dumps(event, ensure_ascii=False) + "\n").encode())
+            self.wfile.flush()
+
         try:
-            self.send_json(get_agent().answer(message))
+            result = get_agent().answer(
+                message,
+                lambda progress: send_event({"type": "progress", **progress}),
+                history=history,
+            )
+            send_event({"type": "result", **result})
         except Exception as error:
-            self.send_json({"error": str(error)}, HTTPStatus.BAD_GATEWAY)
+            send_event({"type": "error", "error": str(error)})
 
     def log_message(self, format: str, *args: object) -> None:
         return
+
+
+def normalize_chat_history(history: Any) -> list[dict[str, str]]:
+    if not isinstance(history, list):
+        return []
+    normalized = []
+    for item in history[-MAX_CHAT_HISTORY:]:
+        if not isinstance(item, dict) or item.get("role") not in {"user", "agent"}:
+            continue
+        text = item.get("text")
+        if not isinstance(text, str) or not text.strip():
+            continue
+        normalized.append({
+            "role": item["role"],
+            "text": text.strip()[:MAX_CHAT_MESSAGE_LENGTH],
+        })
+    return normalized
 
 
 def main() -> None:

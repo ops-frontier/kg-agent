@@ -250,7 +250,19 @@ class Neo4jGraphStore:
                 """,
                 full_name=full_name,
             ))
-        return {"nodes": [dict(record) for record in records]}
+            imports = list(session.run(
+                """
+                MATCH (:Repository {full_name: $full_name})-[:CONTAINS]->(source:File)
+                MATCH (source)-[:IMPORTS]->(target:File)
+                RETURN source.id AS source, target.id AS target
+                ORDER BY source, target
+                """,
+                full_name=full_name,
+            ))
+        return {
+            "nodes": [dict(record) for record in records],
+            "imports": [dict(record) for record in imports],
+        }
 
 
 def repository_payload(
@@ -276,6 +288,7 @@ def repository_payload(
     return {
         "repository": repository_properties,
         "files": file_payloads(full_name, source_data),
+        "file_imports": file_import_payloads(full_name, source_data),
         "functions": function_payloads(full_name, owner, source_data),
         "classes": class_payloads(full_name, owner, source_data),
         "commits": commit_payloads(full_name, owner, github_data["commits"]["items"]),
@@ -301,6 +314,17 @@ def file_payloads(repository: str, source_data: list[dict[str, Any]]) -> list[di
             "imports": item.get("imports", []),
         }
         for item in source_data
+    ]
+
+
+def file_import_payloads(repository: str, source_data: list[dict[str, Any]]) -> list[dict[str, str]]:
+    return [
+        {
+            "source": f"{repository}:{item['path']}",
+            "target": f"{repository}:{target}",
+        }
+        for item in source_data
+        for target in item.get("resolved_imports", [])
     ]
 
 
@@ -470,9 +494,10 @@ def _repository_fingerprint_tx(tx: Any, full_name: str) -> Any:
         """
         MATCH (r:Repository {full_name: $full_name})
          RETURN r.updatedAt AS updatedAt, r.pushedAt AS pushedAt, r.head_oid AS head_oid,
-             r.source_schema_version AS source_schema_version
+             r[$source_schema_version_key] AS source_schema_version
         """,
         full_name=full_name,
+        source_schema_version_key="source_schema_version",
     ).single()
 
 
@@ -544,6 +569,15 @@ def _write_repository_tx(tx: Any, payload: dict[str, Any]) -> None:
         """,
         repository=repository["full_name"],
         files=payload["files"],
+    ).consume()
+    tx.run(
+        """
+        UNWIND $file_imports AS item
+        MATCH (source:File {id: item.source})
+        MATCH (target:File {id: item.target})
+        MERGE (source)-[:IMPORTS]->(target)
+        """,
+        file_imports=payload["file_imports"],
     ).consume()
     tx.run(
         """

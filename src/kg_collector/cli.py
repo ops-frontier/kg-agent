@@ -10,9 +10,11 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Callable
 
+from wcmatch import fnmatch
+
 from .dependencies import analyze_manifests
 from .github import GitHubClient, GitHubError
-from .source import analyze_file_isolated, iter_source_files
+from .source import analyze_file_isolated, iter_source_files, resolve_file_imports
 from .storage import Neo4jGraphStore, graph_store_from_env
 
 
@@ -50,10 +52,12 @@ def main(
         print(f"Repository discovery failed: {error}", file=sys.stderr)
         return 1
     selected = set(args.repositories or [])
+    repository_glob = os.environ.get("TARGET_REPOSITORY_GLOB", "")
     repositories = [
         repository for repository in repositories
         if (not selected or repository["name"] in selected)
         and (args.include_archived or not repository["isArchived"])
+        and repository_matches_glob(repository["name"], repository_glob)
     ]
     if selected - {repository["name"] for repository in repositories}:
         missing = ", ".join(sorted(selected - {repository["name"] for repository in repositories}))
@@ -119,6 +123,10 @@ def repository_is_current(store: Neo4jGraphStore, repository: dict[str, Any]) ->
     return store.repository_is_current(repository)
 
 
+def repository_matches_glob(name: str, pattern: str) -> bool:
+    return not pattern or fnmatch.fnmatch(name, pattern, flags=fnmatch.EXTMATCH)
+
+
 def collect_one(
     client: GitHubClient,
     store: Neo4jGraphStore,
@@ -135,6 +143,7 @@ def collect_one(
             analyze_file_isolated(path, checkout, language)
             for path, language in iter_source_files(checkout, args.max_file_bytes)
         ]
+        resolve_file_imports(checkout, source_data)
         manifests = analyze_manifests(checkout, repository_names)
     store.write_repository(args.owner, github_data, source_data, manifests)
     return {

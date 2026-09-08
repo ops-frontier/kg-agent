@@ -1,6 +1,6 @@
 from pathlib import Path
 
-from kg_collector.source import analyze_file, analyze_file_isolated
+from kg_collector.source import analyze_file, analyze_file_isolated, resolve_file_imports
 
 
 def test_analyze_python_symbols_and_calls(tmp_path: Path) -> None:
@@ -32,6 +32,31 @@ def test_analyze_typescript_symbols(tmp_path: Path) -> None:
     assert result["functions"][0]["name"] == "load"
     assert result["functions"][0]["calls"] == ["request"]
     assert result["imports"] == ["import { request } from './http';"]
+    assert result["import_modules"] == ["./http"]
+
+
+def test_resolve_tsx_relative_index_and_alias_imports(tmp_path: Path) -> None:
+    (tmp_path / "src/components").mkdir(parents=True)
+    (tmp_path / "src/hooks").mkdir()
+    (tmp_path / "src/components/Search.tsx").write_text("", encoding="utf-8")
+    (tmp_path / "src/components/Dialog.tsx").write_text("", encoding="utf-8")
+    (tmp_path / "src/hooks/index.ts").write_text("", encoding="utf-8")
+    (tmp_path / "tsconfig.json").write_text(
+        '{"compilerOptions":{"baseUrl":".","paths":{"@/*":["src/*"]}}}',
+        encoding="utf-8",
+    )
+    source_data = [
+        {"path": "src/components/Search.tsx", "import_modules": ["./Dialog", "@/hooks", "react"]},
+        {"path": "src/components/Dialog.tsx", "import_modules": []},
+        {"path": "src/hooks/index.ts", "import_modules": []},
+    ]
+
+    resolve_file_imports(tmp_path, source_data)
+
+    assert source_data[0]["resolved_imports"] == [
+        "src/components/Dialog.tsx",
+        "src/hooks/index.ts",
+    ]
 
 
 def test_analyze_tsx_arrow_function_names(tmp_path: Path) -> None:

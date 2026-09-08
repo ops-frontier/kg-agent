@@ -30,26 +30,51 @@ class Neo4jStubHandler(BaseHTTPRequestHandler):
 
 def test_chat_returns_graphrag_response(monkeypatch, tmp_path) -> None:
     class StubAgent:
-        def answer(self, question):
+        def answer(self, question, progress, history):
             assert question == "影響範囲は？"
+            assert history == [{"role": "user", "text": "delivery-api を調べて"}]
+            progress({"stage": "search", "iteration": 1})
             return {"message": "呼び出し元が影響を受けます", "sources": [{"function": "caller"}]}
 
     monkeypatch.setattr(agent_server, "get_agent", lambda: StubAgent())
     server = start_server(tmp_path)
     connection = http.client.HTTPConnection(*server.server_address)
     try:
-        body = json.dumps({"message": "影響範囲は？"})
+        body = json.dumps({
+            "message": "影響範囲は？",
+            "history": [{"role": "user", "text": "delivery-api を調べて"}],
+        })
         connection.request("POST", "/api/chat", body, {"Content-Type": "application/json"})
         response = connection.getresponse()
         assert response.status == 200
-        assert json.load(response) == {
+        assert response.getheader("Content-Type") == "application/x-ndjson; charset=utf-8"
+        assert [json.loads(line) for line in response.readlines()] == [{
+            "type": "progress",
+            "stage": "search",
+            "iteration": 1,
+        }, {
+            "type": "result",
             "message": "呼び出し元が影響を受けます",
             "sources": [{"function": "caller"}],
-        }
+        }]
     finally:
         connection.close()
         server.shutdown()
         server.server_close()
+
+
+def test_proxy_treats_broken_pipe_as_client_disconnect(monkeypatch) -> None:
+    handler = object.__new__(agent_server.Handler)
+    handler.close_connection = False
+
+    def disconnected(self, base_url, path):
+        raise BrokenPipeError
+
+    monkeypatch.setattr(agent_server.Handler, "_proxy", disconnected)
+
+    handler.proxy()
+
+    assert handler.close_connection
 
 
 def test_spa_falls_back_to_index_for_browser_routes(tmp_path) -> None:

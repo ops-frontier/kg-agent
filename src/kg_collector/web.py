@@ -10,10 +10,11 @@ from urllib.parse import unquote, urlparse
 
 from neo4j.exceptions import Neo4jError, ServiceUnavailable
 
-from .cli import main as collect
+from .cli import main as collect, repository_matches_glob
 from .storage import Neo4jGraphStore, graph_store_from_env
 
 OWNER = os.environ.get("GH_TARGET_ORGANIZATION", "")
+REPOSITORY_GLOB = os.environ.get("TARGET_REPOSITORY_GLOB", "")
 store_lock = threading.Lock()
 store: Neo4jGraphStore | None = None
 collection_lock = threading.RLock()
@@ -105,7 +106,14 @@ class Handler(BaseHTTPRequestHandler):
         try:
             path = urlparse(self.path).path
             if path == "/api/repositories":
-                self.send_json(graph_store().repositories(OWNER))
+                data = graph_store().repositories(OWNER)
+                data["repositories"] = [
+                    repository
+                    for repository in data["repositories"]
+                    if repository_matches_glob(repository["name"], REPOSITORY_GLOB)
+                ]
+                data["repository_glob"] = REPOSITORY_GLOB
+                self.send_json(data)
             elif path.startswith("/api/repositories/"):
                 repository = unquote(path.removeprefix("/api/repositories/"))
                 detail = graph_store().repository_detail(OWNER, repository)

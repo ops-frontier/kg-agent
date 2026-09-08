@@ -1,6 +1,7 @@
 from kg_collector.cli import repository_is_current
 from kg_collector.storage import (
     Neo4jGraphStore,
+    _repository_fingerprint_tx,
     call_edge_resolutions,
     clean_properties,
     repository_payload,
@@ -21,6 +22,11 @@ def test_repository_payload_models_files_symbols_and_dependencies() -> None:
         "parse_has_error": False, "classes": [],
         "functions": [{"name": "run", "kind": "function_definition", "start_line": 3, "end_line": 4, "calls": ["send"]}],
         "variables": [], "imports": ["from client import send"],
+        "resolved_imports": ["src/api/client.py"],
+    }, {
+        "schema_version": 1, "path": "src/api/client.py", "language": "python",
+        "parse_has_error": False, "classes": [], "functions": [],
+        "variables": [], "imports": [], "resolved_imports": [],
     }]
     manifests = [{"path": "pyproject.toml", "type": "pyproject.toml", "dependencies": [{"name": "lib", "version": "*", "scope": "dependencies", "repository_dependency": "lib"}]}]
 
@@ -29,6 +35,10 @@ def test_repository_payload_models_files_symbols_and_dependencies() -> None:
     assert payload["repository"]["full_name"] == "owner/demo"
     assert payload["repository"]["source_schema_version"] == SOURCE_SCHEMA_VERSION
     assert payload["files"][0]["id"] == "owner/demo:src/api/app.py"
+    assert payload["file_imports"] == [{
+        "source": "owner/demo:src/api/app.py",
+        "target": "owner/demo:src/api/client.py",
+    }]
     assert payload["functions"][0]["calls"] == ["send"]
     assert payload["repository_dependencies"] == [{"source": "owner/demo", "target": "owner/lib"}]
     assert payload["fixes"] == [{"commit_id": "owner/demo:commit:abc", "issue_id": "owner/demo:issue:7"}]
@@ -52,6 +62,21 @@ def test_repository_is_current_uses_store_fingerprint() -> None:
     assert repository_is_current(store, repository)
     store.current = False
     assert not repository_is_current(store, repository)
+
+
+def test_repository_fingerprint_uses_dynamic_schema_version_property() -> None:
+    class Result:
+        def single(self):
+            return None
+
+    class Transaction:
+        def run(self, query, **parameters):
+            assert "r.source_schema_version" not in query
+            assert "r[$source_schema_version_key]" in query
+            assert parameters["source_schema_version_key"] == "source_schema_version"
+            return Result()
+
+    assert _repository_fingerprint_tx(Transaction(), "owner/repository") is None
 
 
 def test_clean_properties_serializes_nested_values() -> None:

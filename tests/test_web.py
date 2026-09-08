@@ -60,6 +60,38 @@ def test_root_does_not_serve_a_web_ui() -> None:
         server.server_close()
 
 
+def test_repositories_response_includes_repository_glob(monkeypatch) -> None:
+    class Store:
+        def repositories(self, owner):
+            return {
+                "owner": owner,
+                "repositories": [
+                    {"name": "delivery-api"},
+                    {"name": "inventory-api"},
+                ],
+            }
+
+    monkeypatch.setattr(web, "OWNER", "owner")
+    monkeypatch.setattr(web, "REPOSITORY_GLOB", "delivery-*")
+    monkeypatch.setattr(web, "graph_store", lambda: Store())
+    server = ThreadingHTTPServer(("127.0.0.1", 0), web.Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    connection = http.client.HTTPConnection(*server.server_address)
+
+    try:
+        connection.request("GET", "/api/repositories")
+        response = connection.getresponse()
+        assert response.status == 200
+        data = json.load(response)
+        assert data["repository_glob"] == "delivery-*"
+        assert data["repositories"] == [{"name": "delivery-api"}]
+    finally:
+        connection.close()
+        server.shutdown()
+        server.server_close()
+
+
 def test_database_failure_returns_service_unavailable(monkeypatch) -> None:
     class Store:
         def repositories(self, owner):

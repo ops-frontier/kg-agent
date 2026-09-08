@@ -67,6 +67,7 @@ GitHubの多数のリポジトリからナレッジグラフを構築するに�
 * **エッジ（関係性）の種類**
 * `(:Repository)-[:CONTAINS]->(:File)`
 * `(:File)-[:DEFINES]->(:Function)`
+* `(:File)-[:IMPORTS]->(:File)`
 * `(:Function)-[:CALLS]->(:Function)` （クロスリポジトリ含む）
 * `(:Function)-[:REFERENCES]->(:Function)` （コールバックやJSX propsとしての参照）
 * `(:User)-[:AUTHORED]->(:Commit)-[:MODIFIED]->(:File)`
@@ -127,6 +128,8 @@ Vertex AI と接続し、「リポジトリAの変更がリポジトリBにど�
 # 対象のリポジトリ
 
 対象のGitHub Organizationは環境変数 `GH_TARGET_ORGANIZATION` で指定する。
+収集するリポジトリ名は環境変数 `TARGET_REPOSITORY_GLOB` で絞り込める。値には `wcmatch` の拡張GLOBを指定し、例えば `delivery-*` なら名前が `delivery-` で始まるリポジトリだけを収集する。未指定または空の場合は、Organization内のすべてのリポジトリを対象とする。
+環境変数は `docker compose up` を実行するシェルで設定し、値を変更した場合は `kg-collector` コンテナを再作成する。フィルタは収集対象とWeb UIの一覧に適用されるが、Neo4jへ保存済みの非該当リポジトリは削除しない。
 
 # GitHubの認証情報
 
@@ -142,7 +145,7 @@ GHCRへのログインには `GITHUB_TOKEN` を使用する。トークンには
 * `kg-collector`: GitHub API、Tree-sitter、Manifest解析を実行し、収集ジョブと参照用のHTTP APIを提供する。Web UIは持たない。
 * `kg-agent`: React SPAをPythonサーバで配信し、`kg-collector` APIへのプロキシとAIチャットAPIを提供する。
 
-`kg-collector` は抽出した情報をYAMLファイルへ保存せず、最初からNeo4jへノードとエッジとして登録する。`kg-agent` の画面状態はブラウザヒストリで管理され、リポジトリ詳細URLやチャットURLへ直接アクセスできる。AIチャットは質問中の関数をNeo4jで照合し、逆向きの `CALLS` 関係を最大5段検索した結果をVertex AIへ渡して回答を生成する。認証機能は設けていない。
+`kg-collector` は抽出した情報をYAMLファイルへ保存せず、最初からNeo4jへノードとエッジとして登録する。TypeScript/TSX の相対 import、拡張子省略、ディレクトリの `index`、`tsconfig.json` / `jsconfig.json` の `baseUrl` と `paths` をリポジトリ内の実在ファイルへ解決し、`IMPORTS` エッジとして保存する。外部npmパッケージはファイルへ解決せず、Manifestの依存関係として扱う。`kg-agent` の画面状態はブラウザヒストリで管理され、リポジトリ詳細URLやチャットURLへ直接アクセスできる。AIチャットは質問中の関数をNeo4jで照合し、逆向きの `CALLS` 関係を最大5段検索した結果をVertex AIへ渡して回答を生成する。認証機能は設けていない。
 
 Neo4j のデータは Docker の named volume `neo4j-data` を `/data` にマウントして永続化する。
 
@@ -159,7 +162,7 @@ devcontainerはDocker-in-Dockerを提供する。devcontainerをrebuildしたあ
 収集結果はNeo4jへ次のように登録する。
 
 * `Repository`, `File`, `Function`, `Class`, `Commit`, `PullRequest`, `Issue`, `User`, `Manifest`, `Dependency` ノードを作成する。
-* `CONTAINS`, `DEFINES`, `CALLS`, `REFERENCES`, `HAS_COMMIT`, `HAS_PULL_REQUEST`, `HAS_ISSUE`, `AUTHORED`, `HAS_MANIFEST`, `DECLARES`, `DEPENDS_ON`, `FIXES` エッジを作成する。
+* `CONTAINS`, `DEFINES`, `IMPORTS`, `CALLS`, `REFERENCES`, `HAS_COMMIT`, `HAS_PULL_REQUEST`, `HAS_ISSUE`, `AUTHORED`, `HAS_MANIFEST`, `DECLARES`, `DEPENDS_ON`, `FIXES` エッジを作成する。
 * `updatedAt`, `pushedAt`, デフォルトブランチの先頭コミットOIDが一致するリポジトリはcloneと解析を省略し、変更されたリポジトリだけを置き換える。
 
 ### docker compose による起動
@@ -169,6 +172,7 @@ devcontainerはDocker-in-Dockerを提供する。devcontainerをrebuildしたあ
 ```bash
 export GH_PAT=<read-only PAT>
 export GH_TARGET_ORGANIZATION=<organization>
+export TARGET_REPOSITORY_GLOB='delivery-*'
 export NEO4J_PASSWORD=<neo4j password>
 export GCP_SA_KEY_JSON="$(cat /path/to/service-account.json)"
 ```
@@ -180,7 +184,17 @@ export GCP_SA_KEY_JSON="$(cat /path/to/service-account.json)"
 ```bash
 export GCP_LOCATION=asia-northeast1
 export GCP_MODEL=gemini-2.5-flash
+export GRAPHRAG_MAX_ITERATIONS=5
+export GRAPHRAG_MAX_RESULTS=100
+export GRAPHRAG_MAX_GITHUB_FILES=10
+export GRAPHRAG_MAX_GITHUB_FILE_BYTES=200000
+export GRAPHRAG_MAX_OUTPUT_TOKENS=8192
+export GRAPHRAG_MAX_OUTPUT_CHUNKS=3
 ```
+
+AIチャットは質問を複数の検索語へ分解し、Neo4jで見つけたファイルをGitHub Contents APIから `GH_PAT` 認証で取得して内容を調べ、未調査の論点がなくなるまで検索と再計画を繰り返す。探索は `GRAPHRAG_MAX_ITERATIONS` 回、累計 `GRAPHRAG_MAX_RESULTS` 件のいずれかへ到達した時点でも停止する。GitHubから取得するファイルは `GRAPHRAG_MAX_GITHUB_FILES` 件まで、各ファイルは `GRAPHRAG_MAX_GITHUB_FILE_BYTES` バイトまでとする。画面には現在の反復回数、検索語、グラフ取得件数、ソース取得件数、回答生成状態を表示する。
+
+回答はMarkdownとして表示する。Vertex AIが出力上限で応答を終了した場合は、1回あたり `GRAPHRAG_MAX_OUTPUT_TOKENS` トークン、最大 `GRAPHRAG_MAX_OUTPUT_CHUNKS` 回まで続きを取得して連結する。
 
 Neo4j、収集API、kg-agent Web UIを起動する。
 
@@ -196,6 +210,8 @@ Codespaces の Ports ビューでは通常 `8080` だけを転送して利用す
 * `7687`: Neo4j Bolt接続（直接デバッグ用）
 
 Codespaces の Ports ビューで `8080` を開いて kg-agent を利用する。収集管理画面では収集状況と対象リポジトリを確認し、収集をバックグラウンドで開始できる。リポジトリ詳細には先頭コミットID、最終コミット日時、ノード数、Call Graphを表示する。AIチャット画面では「`repository-a` の `process_order` を変更した際の影響範囲は？」のように質問でき、回答とNeo4j上の根拠を確認できる。
+
+AIチャットの履歴はブラウザのローカルストレージに保存され、ページを再読み込みしても復元される。後続の質問では直近20件の会話をコンテキストとして使用する。履歴とコンテキストはAIチャット画面の「チャットをクリア」ボタンで削除できる。
 
 `kg-collector` は次の認証なしAPIを提供する。
 

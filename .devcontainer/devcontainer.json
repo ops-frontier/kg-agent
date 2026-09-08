@@ -4,6 +4,7 @@
   "features": {
     "ghcr.io/devcontainers/features/docker-in-docker:2": {}
   },
+  "postCreateCommand": "/usr/local/bin/python -m pip install -e '.[dev]'",
   "forwardPorts": [8080],
   "portsAttributes": {
     "8080": {
@@ -14,6 +15,9 @@
   },
   "customizations": {
     "vscode": {
+      "settings": {
+        "python.defaultInterpreterPath": "/usr/local/bin/python"
+      },
       "extensions": [
         "ms-python.python",
         "ms-python.vscode-pylance",

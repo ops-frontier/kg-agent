@@ -1,10 +1,26 @@
 import React, { useEffect, useState } from 'react'
 import { createRoot } from 'react-dom/client'
+import ReactMarkdown from 'react-markdown'
+import remarkGfm from 'remark-gfm'
 import {
   ArrowLeft, Bot, Boxes, CheckCircle2, ChevronRight, CircleDot, Database, GitBranch,
-  LoaderCircle, MessageSquareText, Network, Play, RefreshCw, Send,
+  LoaderCircle, MessageSquareText, Network, Play, RefreshCw, Send, Trash2,
 } from 'lucide-react'
 import './styles.css'
+
+const CHAT_STORAGE_KEY = 'kg-agent.chat-history'
+const CHAT_CONTEXT_LIMIT = 20
+const CHAT_MESSAGE_LENGTH_LIMIT = 8_000
+const WELCOME_MESSAGE = { role: 'agent', text: 'ナレッジグラフについて質問してください。' }
+
+const loadChatHistory = () => {
+  try {
+    const history = JSON.parse(window.localStorage.getItem(CHAT_STORAGE_KEY) || '[]')
+    return Array.isArray(history) ? [WELCOME_MESSAGE, ...history] : [WELCOME_MESSAGE]
+  } catch {
+    return [WELCOME_MESSAGE]
+  }
+}
 
 const api = async (url, options) => {
   const response = await fetch(url, options)
@@ -62,11 +78,13 @@ function StatusBar({ status }) {
 function Collection({ status, onCollect }) {
   const [repositories, setRepositories] = useState([])
   const [owner, setOwner] = useState('')
+  const [repositoryGlob, setRepositoryGlob] = useState('')
   const [error, setError] = useState('')
   useEffect(() => {
     api('/api/repositories').then((data) => {
       setRepositories(data.repositories || [])
       setOwner(data.owner || '')
+      setRepositoryGlob(data.repository_glob || '')
       setError('')
     }).catch((reason) => setError(reason.message))
   }, [status.running])
@@ -77,7 +95,10 @@ function Collection({ status, onCollect }) {
         <div>
           <p className="kicker">COLLECTION CONTROL</p>
           <h1>ナレッジグラフ収集</h1>
-          <p className="lead">{owner || 'Organization 未設定'} の解析状況と対象リポジトリ</p>
+          <p className="lead">
+            対象組織： {owner || '未設定'}
+            {repositoryGlob && <span> (リポジトリ名パターン={repositoryGlob})</span>}
+          </p>
         </div>
         <button className="primary" onClick={onCollect} disabled={status.running}>
           {status.running ? <RefreshCw size={18} /> : <Play size={18} />}
@@ -146,8 +167,17 @@ function Repository({ name }) {
 
 function Chat() {
   const [input, setInput] = useState('')
-  const [messages, setMessages] = useState([{ role: 'agent', text: 'ナレッジグラフについて質問してください。' }])
+  const [messages, setMessages] = useState(loadChatHistory)
   const [loading, setLoading] = useState(false)
+  const [progress, setProgress] = useState(null)
+  useEffect(() => {
+    const history = messages.filter((message) => message !== WELCOME_MESSAGE && message.role !== 'error')
+    try {
+      window.localStorage.setItem(CHAT_STORAGE_KEY, JSON.stringify(history))
+    } catch {
+      // Continue without persistence when browser storage is unavailable or full.
+    }
+  }, [messages])
   const submit = async (event) => {
     event.preventDefault()
     if (!input.trim() || loading) return
@@ -155,22 +185,72 @@ function Chat() {
     setInput('')
     setMessages((items) => [...items, { role: 'user', text: question }])
     setLoading(true)
+    setProgress({ stage: 'starting', results: 0 })
     try {
-      const response = await api('/api/chat', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ message: question }) })
-      setMessages((items) => [...items, { role: 'agent', text: response.message, sources: response.sources || [] }])
+      const history = messages
+        .filter((message) => message !== WELCOME_MESSAGE && ['user', 'agent'].includes(message.role))
+        .slice(-CHAT_CONTEXT_LIMIT)
+        .map(({ role, text }) => ({ role, text: text.slice(0, CHAT_MESSAGE_LENGTH_LIMIT) }))
+      const response = await fetch('/api/chat', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ message: question, history }),
+      })
+      if (!response.ok || !response.body) throw new Error(`Request failed: ${response.status}`)
+      const reader = response.body.getReader()
+      const decoder = new TextDecoder()
+      let buffer = ''
+      const handleEvent = (line) => {
+        if (!line.trim()) return
+        const streamEvent = JSON.parse(line)
+        if (streamEvent.type === 'progress') setProgress(streamEvent)
+        if (streamEvent.type === 'result') {
+          setMessages((items) => [...items, { role: 'agent', text: streamEvent.message, sources: streamEvent.sources || [] }])
+        }
+        if (streamEvent.type === 'error') throw new Error(streamEvent.error)
+      }
+      while (true) {
+        const { value, done } = await reader.read()
+        buffer += decoder.decode(value || new Uint8Array(), { stream: !done })
+        const lines = buffer.split('\n')
+        buffer = lines.pop() || ''
+        lines.forEach(handleEvent)
+        if (done) break
+      }
+      handleEvent(buffer)
     } catch (reason) {
       setMessages((items) => [...items, { role: 'error', text: reason.message }])
     } finally {
       setLoading(false)
+      setProgress(null)
     }
+  }
+  const clearChat = () => {
+    try {
+      window.localStorage.removeItem(CHAT_STORAGE_KEY)
+    } catch {
+      // The in-memory history is still cleared when browser storage is unavailable.
+    }
+    setMessages([WELCOME_MESSAGE])
+    setInput('')
+    setProgress(null)
   }
   return (
     <main className="chat-page">
-      <header className="page-header"><div><p className="kicker">KNOWLEDGE ASSISTANT</p><h1>AIエージェント</h1><p className="lead">Vertex AI + Neo4j GraphRAG</p></div><Bot size={38} /></header>
+      <header className="page-header">
+        <div><p className="kicker">KNOWLEDGE ASSISTANT</p><h1>AIエージェント</h1><p className="lead">Vertex AI + Neo4j GraphRAG</p></div>
+        <button className="clear-chat" type="button" onClick={clearChat} disabled={loading}>
+          <Trash2 size={17} />チャットをクリア
+        </button>
+      </header>
       <div className="conversation" aria-live="polite">
         {messages.map((message, index) => (
           <div className={`message ${message.role}`} key={index}>
-            <div className="message-text">{message.text}</div>
+            {message.role === 'agent' ? (
+              <div className="message-text markdown">
+                <ReactMarkdown remarkPlugins={[remarkGfm]}>{message.text}</ReactMarkdown>
+              </div>
+            ) : <div className="message-text">{message.text}</div>}
             {message.sources?.length > 0 && (
               <details className="evidence">
                 <summary>Neo4j 根拠 {message.sources.length}件</summary>
@@ -187,7 +267,17 @@ function Chat() {
             )}
           </div>
         ))}
-        {loading && <div className="message agent pending"><LoaderCircle size={18} />Neo4j を検索して回答を生成中</div>}
+        {loading && (
+          <div className="message agent pending">
+            <LoaderCircle size={18} />
+            {progress?.stage === 'search' && `反復 ${progress.iteration} / ${progress.max_iterations}: ${progress.queries.join('、')} を検索中`}
+            {progress?.stage === 'github' && `GitHub からソース ${progress.files.length}件を取得中（${progress.fetched} / ${progress.max_files}件）`}
+            {progress?.stage === 'github_complete' && `GitHub ソース取得済み ${progress.fetched} / ${progress.max_files}件${progress.failed ? `（${progress.failed}件失敗）` : ''}`}
+            {progress?.stage === 'planning' && `反復 ${progress.iteration}: ${progress.added}件追加（合計 ${progress.results} / ${progress.max_results}件）、次の調査を計画中`}
+            {progress?.stage === 'answering' && `${progress.iterations}回の探索・${progress.results}件のグラフ結果・${progress.files}件のソースから回答を生成中`}
+            {progress?.stage === 'starting' && '調査を開始しています'}
+          </div>
+        )}
       </div>
       <form className="composer" onSubmit={submit}>
         <input value={input} onChange={(event) => setInput(event.target.value)} placeholder="例: repository-a の process_order を変更した際の影響範囲は？" aria-label="メッセージ" disabled={loading} />

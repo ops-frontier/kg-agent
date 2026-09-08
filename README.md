@@ -261,4 +261,4 @@ python -m pip install -e '.[dev]'
 python -m pytest -q
 ```
 
-React SPAだけを開発する場合は `kg_agent` ディレクトリで `npm install` と `npm run dev` を実行する。本番用SPAは `kg-agent` イメージのビルド時に生成される。
+React SPAだけを開発する場合は `src/kg_agent` ディレクトリで `npm install` と `npm run dev` を実行する。本番用SPAは `kg-agent` イメージのビルド時に生成される。

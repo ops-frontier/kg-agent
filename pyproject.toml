@@ -22,7 +22,7 @@ dev = ["pytest>=8.3,<10"]
 kg-collect = "kg_collector.cli:main"
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/kg_collector"]
+packages = ["src/kg_agent", "src/kg_collector"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

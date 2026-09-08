@@ -97,7 +97,7 @@ Web UI はチャット履歴をブラウザのローカルストレージの `kg
 | 環境変数 | 既定値 | 説明 |
 | --- | --- | --- |
 | `PORT` | `8080` | kg-agent の HTTP 待受ポート。 |
-| `STATIC_DIR` | `kg_agent/dist` | React SPA の静的ファイルを配信するディレクトリ。コンテナでは `/opt/kg-agent/dist` を使用する。 |
+| `STATIC_DIR` | `src/kg_agent/dist` | React SPA の静的ファイルを配信するディレクトリ。コンテナでは `/opt/kg-agent/dist` を使用する。 |
 | `COLLECTOR_URL` | `http://kg-collector:8081` | 収集状態、リポジトリ、グラフ、収集開始 API のプロキシ転送先。末尾の `/` は除去される。 |
 
 ## Docker Compose 設定例

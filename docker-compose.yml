@@ -30,7 +30,7 @@ services:
       NEO4J_TRANSACTION_RETRY_SECONDS: 120
 
   kg-agent:
-    build: ./kg_agent
+    build: ./src/kg_agent
     restart: unless-stopped
     depends_on:
       kg-collector:

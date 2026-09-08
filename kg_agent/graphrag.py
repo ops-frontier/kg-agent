@@ -6,7 +6,7 @@ import urllib.error
 import urllib.request
 from dataclasses import dataclass
 from typing import Any, Callable
-from urllib.parse import quote
+from urllib.parse import quote, urlencode
 
 from google.auth.transport.requests import AuthorizedSession
 from google.oauth2 import service_account
@@ -96,22 +96,42 @@ class GitHubFileClient:
         self.token = token
         self.max_file_bytes = max_file_bytes
 
-    def fetch(self, repository: str, path: str) -> str:
-        url = f"https://api.github.com/repos/{quote(repository, safe='/')}/contents/{quote(path, safe='/')}"
-        request = urllib.request.Request(
+    def _request(self, url: str, accept: str) -> urllib.request.Request:
+        return urllib.request.Request(
             url,
             headers={
-                "Accept": "application/vnd.github.raw+json",
+                "Accept": accept,
                 "Authorization": f"Bearer {self.token}",
                 "User-Agent": "knowledge-graph-agent/0.1",
                 "X-GitHub-Api-Version": "2022-11-28",
             },
         )
+
+    def fetch(self, repository: str, path: str) -> str:
+        url = f"https://api.github.com/repos/{quote(repository, safe='/')}/contents/{quote(path, safe='/')}"
+        request = self._request(url, "application/vnd.github.raw+json")
         with urllib.request.urlopen(request, timeout=30) as response:
             content = response.read(self.max_file_bytes + 1)
         if len(content) > self.max_file_bytes:
             raise ValueError(f"GitHub file exceeds {self.max_file_bytes} bytes")
         return content.decode("utf-8", errors="replace")
+
+    def search(self, query: str, limit: int) -> list[tuple[str, str]]:
+        parameters = urlencode({"q": query, "per_page": max(1, min(limit, 100))})
+        request = self._request(
+            f"https://api.github.com/search/code?{parameters}",
+            "application/vnd.github+json",
+        )
+        with urllib.request.urlopen(request, timeout=30) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+        return [
+            (item["repository"]["full_name"], item["path"])
+            for item in payload.get("items", [])
+            if isinstance(item, dict)
+            and isinstance(item.get("repository"), dict)
+            and item["repository"].get("full_name")
+            and item.get("path")
+        ][:limit]
 
 
 class GraphRAGAgent:
@@ -233,15 +253,20 @@ class GraphRAGAgent:
         seen_records: set[str] = set()
         seen_sources: set[tuple[Any, ...]] = set()
         searched_queries: set[str] = set()
+        searched_github_queries: set[str] = set()
         fetched_files: set[tuple[str, str]] = set()
         pending_queries = [contextual_question]
+        pending_github_queries: list[str] = []
         completed_iterations = 0
 
         for iteration in range(1, self.max_iterations + 1):
             queries = [item for item in pending_queries if item not in searched_queries][
                 :MAX_QUERIES_PER_ITERATION
             ]
-            if not queries or len(context) >= self.max_results:
+            github_queries = [
+                item for item in pending_github_queries if item not in searched_github_queries
+            ][:MAX_QUERIES_PER_ITERATION]
+            if (not queries or len(context) >= self.max_results) and not github_queries:
                 break
             completed_iterations = iteration
             notify({
@@ -249,11 +274,12 @@ class GraphRAGAgent:
                 "iteration": iteration,
                 "max_iterations": self.max_iterations,
                 "queries": queries,
+                "github_queries": github_queries,
                 "results": len(context),
                 "max_results": self.max_results,
             })
             added = 0
-            for query in queries:
+            for query in queries if len(context) < self.max_results else []:
                 searched_queries.add(query)
                 records, retrieved_sources = self._retrieve(
                     query,
@@ -304,6 +330,54 @@ class GraphRAGAgent:
                         "failed": failures,
                         "max_files": self.max_github_files,
                     })
+            for github_query in github_queries:
+                searched_github_queries.add(github_query)
+                remaining_files = self.max_github_files - len(fetched_files)
+                if remaining_files <= 0 or self.github_client is None:
+                    continue
+                try:
+                    matches = self.github_client.search(github_query, remaining_files)
+                except (OSError, ValueError, json.JSONDecodeError, urllib.error.HTTPError, urllib.error.URLError):
+                    continue
+                candidates = [item for item in matches if item not in fetched_files][
+                    :remaining_files
+                ]
+                if not candidates:
+                    continue
+                notify({
+                    "stage": "github",
+                    "iteration": iteration,
+                    "query": github_query,
+                    "files": [f"{repository}/{path}" for repository, path in candidates],
+                    "fetched": len(fetched_files),
+                    "max_files": self.max_github_files,
+                })
+                failures = 0
+                for repository, path in candidates:
+                    fetched_files.add((repository, path))
+                    try:
+                        content = self.github_client.fetch(repository, path)
+                    except (OSError, ValueError, urllib.error.HTTPError, urllib.error.URLError):
+                        failures += 1
+                        continue
+                    file_context.append({
+                        "result_type": "github_code_search",
+                        "query": github_query,
+                        "repository": repository,
+                        "file": path,
+                        "content": content,
+                    })
+                    source_key = (repository, path, "", None, 0)
+                    if source_key not in seen_sources:
+                        seen_sources.add(source_key)
+                        sources.append(GraphSource(repository, path, "", None, 0))
+                notify({
+                    "stage": "github_complete",
+                    "iteration": iteration,
+                    "fetched": len(file_context),
+                    "failed": failures,
+                    "max_files": self.max_github_files,
+                })
             notify({
                 "stage": "planning",
                 "iteration": iteration,
@@ -313,12 +387,13 @@ class GraphRAGAgent:
             })
             if len(context) >= self.max_results:
                 break
-            pending_queries = self._next_queries(
+            pending_queries, pending_github_queries = self._next_queries(
                 contextual_question,
                 context + file_context,
                 sorted(searched_queries),
+                sorted(searched_github_queries),
             )
-            if not pending_queries:
+            if not pending_queries and not pending_github_queries:
                 break
 
         notify({
@@ -420,27 +495,43 @@ class GraphRAGAgent:
         question: str,
         context: list[dict[str, Any]],
         searched_queries: list[str],
-    ) -> list[str]:
+        searched_github_queries: list[str],
+    ) -> tuple[list[str], list[str]]:
         prompt = (
-            "質問をナレッジグラフで解決するため、未調査の論点を検索語へ分解してください。"
-            "既に十分な場合、または新しい検索ができない場合は queries を空配列にしてください。"
-            "検索語には実在が期待されるリポジトリ名、ファイル名、関数名を含めてください。"
-            f"最大{MAX_QUERIES_PER_ITERATION}件です。JSON以外は返さないでください。\n\n"
+            "質問を解決するため、未調査の論点を検索語へ分解してください。"
+            "リポジトリ名、ファイル名、関数名と関係を調べる語は queries に入れてください。"
+            "ソース本文にしかない識別子、文字列、設定キー、エラーメッセージなどのキーワード検索が"
+            "必要な場合だけ、GitHub Code Search 構文の検索語を github_queries に入れてください。"
+            "GitHub検索では判明している repo:owner/name または org:name 修飾子を付け、"
+            "質問文全体ではなく絞り込めるキーワードを指定してください。"
+            "既に十分な場合、または新しい検索ができない場合は両方を空配列にしてください。"
+            f"検索語は合計最大{MAX_QUERIES_PER_ITERATION}件です。JSON以外は返さないでください。\n\n"
             f"質問: {question}\n"
-            f"検索済み: {json.dumps(searched_queries, ensure_ascii=False)}\n"
+            f"Neo4j検索済み: {json.dumps(searched_queries, ensure_ascii=False)}\n"
+            f"GitHub検索済み: {json.dumps(searched_github_queries, ensure_ascii=False)}\n"
             f"現在の結果: {json.dumps(context, ensure_ascii=False)}\n\n"
-            '形式: {"queries":["検索語1","検索語2"]}'
+            '形式: {"queries":["グラフ検索語"],"github_queries":["コード検索語"]}'
         )
         try:
             payload = json.loads(self._generate(prompt, response_mime_type="application/json"))
         except (json.JSONDecodeError, TypeError):
-            return []
+            return [], []
         queries = payload.get("queries", []) if isinstance(payload, dict) else []
-        return [
+        github_queries = payload.get("github_queries", []) if isinstance(payload, dict) else []
+        next_queries = [
             query.strip()
             for query in queries
             if isinstance(query, str) and query.strip() and query.strip() not in searched_queries
         ][:MAX_QUERIES_PER_ITERATION]
+        remaining = MAX_QUERIES_PER_ITERATION - len(next_queries)
+        next_github_queries = [
+            query.strip()
+            for query in github_queries
+            if isinstance(query, str)
+            and query.strip()
+            and query.strip() not in searched_github_queries
+        ][:remaining]
+        return next_queries, next_github_queries
 
     def _generate(self, prompt: str, response_mime_type: str | None = None) -> str:
         host = (

@@ -92,13 +92,19 @@ class ChunkedSession:
 
 
 class FakeGitHubClient:
-    def __init__(self, contents):
+    def __init__(self, contents, search_results=None):
         self.contents = contents
         self.requests = []
+        self.search_results = search_results or {}
+        self.searches = []
 
     def fetch(self, repository, path):
         self.requests.append((repository, path))
         return self.contents[(repository, path)]
+
+    def search(self, query, limit):
+        self.searches.append((query, limit))
+        return self.search_results.get(query, [])[:limit]
 
 
 class GitHubResponse:
@@ -113,6 +119,11 @@ class GitHubResponse:
 
     def read(self, limit):
         return self.content[:limit]
+
+
+class GitHubSearchResponse(GitHubResponse):
+    def read(self):
+        return self.content
 
 
 def make_agent(records=None, *, files=None, impacts=None, plans=None, max_iterations=5, max_results=100, github_client=None, max_github_files=10):
@@ -282,6 +293,38 @@ def test_answer_fetches_graph_files_from_github_for_further_planning() -> None:
     ]
 
 
+def test_answer_uses_github_code_search_when_planner_requests_it() -> None:
+    query = '"FEATURE_FLAG" repo:owner/repo'
+    github = FakeGitHubClient(
+        {("owner/repo", "src/flags.py"): 'FEATURE_FLAG = "new-checkout"'},
+        {query: [("owner/repo", "src/flags.py")]},
+    )
+    progress = []
+    agent = make_agent(
+        plans=[
+            {"queries": [], "github_queries": [query]},
+            {"queries": [], "github_queries": []},
+        ],
+        github_client=github,
+    )
+
+    result = agent.answer("FEATURE_FLAG が使われている場所を調べて", progress.append)
+
+    assert github.searches == [(query, 10)]
+    assert github.requests == [("owner/repo", "src/flags.py")]
+    assert result["sources"] == [{
+        "repository": "owner/repo",
+        "file": "src/flags.py",
+        "function": "",
+        "line": None,
+        "depth": 0,
+    }]
+    assert 'FEATURE_FLAG = \\"new-checkout\\"' in agent.session.body["contents"][0]["parts"][0]["text"]
+    assert [item["stage"] for item in progress] == [
+        "search", "planning", "search", "github", "github_complete", "planning", "answering",
+    ]
+
+
 def test_github_file_client_uses_pat_and_encodes_path(monkeypatch) -> None:
     captured = {}
 
@@ -311,6 +354,29 @@ def test_github_file_client_rejects_oversized_files(monkeypatch) -> None:
 
     with pytest.raises(ValueError, match="exceeds 5 bytes"):
         GitHubFileClient("secret-token", 5).fetch("owner/repo", "large.tsx")
+
+
+def test_github_file_client_searches_code_with_pat(monkeypatch) -> None:
+    captured = {}
+
+    def urlopen(request, timeout):
+        captured["request"] = request
+        captured["timeout"] = timeout
+        return GitHubSearchResponse(
+            b'{"items":[{"path":"src/search.py","repository":{"full_name":"owner/repo"}}]}'
+        )
+
+    monkeypatch.setattr("kg_agent.graphrag.urllib.request.urlopen", urlopen)
+
+    results = GitHubFileClient("secret-token", 100).search('"error code" language:python', 5)
+
+    assert results == [("owner/repo", "src/search.py")]
+    assert captured["request"].get_header("Authorization") == "Bearer secret-token"
+    assert captured["request"].get_header("Accept") == "application/vnd.github+json"
+    assert captured["request"].full_url.endswith(
+        "search/code?q=%22error+code%22+language%3Apython&per_page=5"
+    )
+    assert captured["timeout"] == 30
 
 
 def test_generate_continues_after_max_tokens() -> None:

@@ -253,7 +253,7 @@ function Chat() {
             ) : <div className="message-text">{message.text}</div>}
             {message.sources?.length > 0 && (
               <details className="evidence">
-                <summary>Neo4j 根拠 {message.sources.length}件</summary>
+                <summary>回答の根拠 {message.sources.length}件</summary>
                 <div className="evidence-list">{message.sources.map((source, sourceIndex) => (
                   <div className="evidence-row" key={`${source.repository}:${source.file}:${source.function}:${sourceIndex}`}>
                     <GitBranch size={15} />
@@ -270,7 +270,7 @@ function Chat() {
         {loading && (
           <div className="message agent pending">
             <LoaderCircle size={18} />
-            {progress?.stage === 'search' && `反復 ${progress.iteration} / ${progress.max_iterations}: ${progress.queries.join('、')} を検索中`}
+            {progress?.stage === 'search' && `反復 ${progress.iteration} / ${progress.max_iterations}: ${[...(progress.queries || []), ...(progress.github_queries || [])].join('、')} を検索中`}
             {progress?.stage === 'github' && `GitHub からソース ${progress.files.length}件を取得中（${progress.fetched} / ${progress.max_files}件）`}
             {progress?.stage === 'github_complete' && `GitHub ソース取得済み ${progress.fetched} / ${progress.max_files}件${progress.failed ? `（${progress.failed}件失敗）` : ''}`}
             {progress?.stage === 'planning' && `反復 ${progress.iteration}: ${progress.added}件追加（合計 ${progress.results} / ${progress.max_results}件）、次の調査を計画中`}

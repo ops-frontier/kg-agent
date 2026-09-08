@@ -26,6 +26,7 @@ CONSTRAINTS = (
     "CREATE CONSTRAINT kg_user_id IF NOT EXISTS FOR (n:User) REQUIRE n.id IS UNIQUE",
     "CREATE CONSTRAINT kg_manifest_id IF NOT EXISTS FOR (n:Manifest) REQUIRE n.id IS UNIQUE",
     "CREATE CONSTRAINT kg_dependency_id IF NOT EXISTS FOR (n:Dependency) REQUIRE n.id IS UNIQUE",
+    "CREATE CONSTRAINT kg_package_id IF NOT EXISTS FOR (n:Package) REQUIRE n.id IS UNIQUE",
     "CREATE CONSTRAINT kg_collection_index_owner IF NOT EXISTS FOR (n:CollectionIndex) REQUIRE n.owner IS UNIQUE",
 )
 
@@ -285,10 +286,12 @@ def repository_payload(
         "manifests": len(manifests),
         "dependencies": sum(len(item["dependencies"]) for item in manifests),
     })
+    packages, package_dependencies, package_edges = npm_package_payloads(full_name, manifests)
     return {
         "repository": repository_properties,
         "files": file_payloads(full_name, source_data),
         "file_imports": file_import_payloads(full_name, source_data),
+        "package_imports": package_import_payloads(full_name, source_data, packages),
         "functions": function_payloads(full_name, owner, source_data),
         "classes": class_payloads(full_name, owner, source_data),
         "commits": commit_payloads(full_name, owner, github_data["commits"]["items"]),
@@ -298,6 +301,9 @@ def repository_payload(
         "manifests": manifest_payloads(full_name, owner, manifests),
         "dependencies": dependency_payloads(full_name, owner, manifests),
         "repository_dependencies": repository_dependency_payloads(full_name, owner, manifests),
+        "packages": packages,
+        "package_dependencies": package_dependencies,
+        "package_edges": package_edges,
         "fixes": fixes_payloads(full_name, github_data["commits"]["items"]),
     }
 
@@ -325,6 +331,27 @@ def file_import_payloads(repository: str, source_data: list[dict[str, Any]]) -> 
         }
         for item in source_data
         for target in item.get("resolved_imports", [])
+    ]
+
+
+def package_import_payloads(
+    repository: str,
+    source_data: list[dict[str, Any]],
+    packages: list[dict[str, str]],
+) -> list[dict[str, str]]:
+    versions_by_name: dict[str, list[str]] = {}
+    for package in packages:
+        versions_by_name.setdefault(package["name"], []).append(package["version"])
+    return [
+        {
+            "source": f"{repository}:{item['path']}",
+            "target": package_id(name, version),
+            "name": name,
+            "version": version,
+        }
+        for item in source_data
+        for name in item.get("package_imports", [])
+        for version in versions_by_name.get(name, ["*"])
     ]
 
 
@@ -455,6 +482,62 @@ def repository_dependency_payloads(repository: str, owner: str, manifests: Itera
     return result
 
 
+def npm_package_payloads(
+    repository: str,
+    manifests: Iterable[dict[str, Any]],
+) -> tuple[list[dict[str, str]], list[dict[str, str]], list[dict[str, str]]]:
+    manifests = list(manifests)
+    package_values = [
+        {"id": package_id(package["name"], package["version"]), **package}
+        for manifest in manifests
+        for package in manifest.get("packages", [])
+    ]
+    versions_by_name: dict[str, list[str]] = {}
+    for package in package_values:
+        versions_by_name.setdefault(package["name"], []).append(package["version"])
+
+    direct_edges = []
+    scope_types = {
+        "dependencies": "production",
+        "devDependencies": "development",
+        "peerDependencies": "peer",
+        "optionalDependencies": "optional",
+    }
+    for manifest in manifests:
+        if manifest["type"] != "package.json":
+            continue
+        for dependency in manifest["dependencies"]:
+            name = dependency["name"]
+            versions = versions_by_name.get(name) or [dependency["version"]]
+            for version in versions:
+                package_values.append({"id": package_id(name, version), "name": name, "version": version})
+                direct_edges.append({
+                    "source": repository,
+                    "target": package_id(name, version),
+                    "type": scope_types[dependency["scope"]],
+                    "version_spec": dependency["version"],
+                })
+
+    transitive_edges = []
+    for manifest in manifests:
+        for edge in manifest.get("edges", []):
+            source_id = package_id(edge["source_name"], edge["source_version"])
+            target_id = package_id(edge["target_name"], edge["target_version"])
+            package_values.extend([
+                {"id": source_id, "name": edge["source_name"], "version": edge["source_version"]},
+                {"id": target_id, "name": edge["target_name"], "version": edge["target_version"]},
+            ])
+            transitive_edges.append({"source": source_id, "target": target_id, "repository": repository})
+    unique_packages = list({package["id"]: package for package in package_values}.values())
+    unique_direct = list({tuple(sorted(edge.items())): edge for edge in direct_edges}.values())
+    unique_transitive = list({tuple(sorted(edge.items())): edge for edge in transitive_edges}.values())
+    return unique_packages, unique_direct, unique_transitive
+
+
+def package_id(name: str, version: str) -> str:
+    return f"npm:{name}@{version}"
+
+
 def fixes_payloads(repository: str, commits: Iterable[dict[str, Any]]) -> list[dict[str, str]]:
     result = []
     for commit in commits:
@@ -541,6 +624,10 @@ def _write_collection_index_tx(tx: Any, owner: str, index: dict[str, Any]) -> No
 def _write_repository_tx(tx: Any, payload: dict[str, Any]) -> None:
     repository = payload["repository"]
     tx.run(
+        "MATCH ()-[r:DEPENDS_ON {repository: $repository}]->() DELETE r",
+        repository=repository["full_name"],
+    ).consume()
+    tx.run(
         """
         MATCH (n {repository: $repository})
         WHERE NOT n:Repository
@@ -578,6 +665,24 @@ def _write_repository_tx(tx: Any, payload: dict[str, Any]) -> None:
         MERGE (source)-[:IMPORTS]->(target)
         """,
         file_imports=payload["file_imports"],
+    ).consume()
+    tx.run(
+        """
+        UNWIND $packages AS item
+        MERGE (p:Package {id: item.id})
+        SET p += item
+        """,
+        packages=payload["packages"],
+    ).consume()
+    tx.run(
+        """
+        UNWIND $package_imports AS item
+        MATCH (source:File {id: item.source})
+        MERGE (target:Package {id: item.target})
+        ON CREATE SET target.name = item.name, target.version = item.version
+        MERGE (source)-[:IMPORTS]->(target)
+        """,
+        package_imports=payload["package_imports"],
     ).consume()
     tx.run(
         """
@@ -686,6 +791,25 @@ def _write_repository_tx(tx: Any, payload: dict[str, Any]) -> None:
     ).consume()
     tx.run(
         """
+        MATCH (source:Repository {full_name: $repository})
+        UNWIND $package_dependencies AS item
+        MATCH (target:Package {id: item.target})
+        MERGE (source)-[dependency:DEPENDS_ON {type: item.type, version_spec: item.version_spec}]->(target)
+        """,
+        repository=repository["full_name"],
+        package_dependencies=payload["package_dependencies"],
+    ).consume()
+    tx.run(
+        """
+        UNWIND $package_edges AS item
+        MATCH (source:Package {id: item.source})
+        MATCH (target:Package {id: item.target})
+        MERGE (source)-[:DEPENDS_ON {repository: item.repository}]->(target)
+        """,
+        package_edges=payload["package_edges"],
+    ).consume()
+    tx.run(
+        """
         UNWIND $fixes AS item
         MATCH (c:Commit {id: item.commit_id})
         MATCH (i:Issue {id: item.issue_id})
@@ -693,6 +817,7 @@ def _write_repository_tx(tx: Any, payload: dict[str, Any]) -> None:
         """,
         fixes=payload["fixes"],
     ).consume()
+    tx.run("MATCH (p:Package) WHERE NOT (p)--() DELETE p").consume()
 
 
 def call_edge_resolutions(

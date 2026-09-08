@@ -41,7 +41,7 @@ VARIABLE_TYPES = {
 }
 CALL_TYPES = {"call", "call_expression", "invocation_expression"}
 PARSER_LOCK = Lock()
-SOURCE_SCHEMA_VERSION = 3
+SOURCE_SCHEMA_VERSION = 4
 MODULE_EXTENSIONS = (".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs")
 
 
@@ -129,6 +129,21 @@ def resolve_file_imports(root: Path, source_data: list[dict[str, Any]]) -> None:
             if target is not None and target not in resolved:
                 resolved.append(target)
         item["resolved_imports"] = resolved
+        item["package_imports"] = list(dict.fromkeys(
+            package_name
+            for module in item.get("import_modules", [])
+            if resolve_module_path(item["path"], module, known_paths, configs) is None
+            if (package_name := npm_package_name(module)) is not None
+        ))
+
+
+def npm_package_name(module: str) -> str | None:
+    if module.startswith((".", "/", "@/", "#")):
+        return None
+    parts = module.split("/")
+    if module.startswith("@"):
+        return "/".join(parts[:2]) if len(parts) >= 2 else None
+    return parts[0] or None
 
 
 def resolve_module_path(

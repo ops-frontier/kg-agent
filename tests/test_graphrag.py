@@ -1,6 +1,6 @@
 import pytest
 
-from kg_agent.graphrag import GitHubFileClient, GraphRAGAgent
+from kg_agent.graphrag import GITHUB_METADATA_QUERY, GitHubFileClient, GraphRAGAgent
 
 
 class FakeNeo4jSession:
@@ -17,8 +17,12 @@ class FakeNeo4jSession:
     def run(self, query, question, result_limit):
         self.questions.append(question)
         assert result_limit > 0
+        if "'package' AS result_type" in query:
+            return self.records.get("packages", [])
         if "'file' AS result_type" in query:
             return self.records.get("files", [])
+        if "'github_metadata' AS result_type" in query:
+            return self.records.get("github_metadata", [])
         assert "CALLS|REFERENCES*1..5" in query
         return self.records.get("impacts", [])
 
@@ -126,11 +130,16 @@ class GitHubSearchResponse(GitHubResponse):
         return self.content
 
 
-def make_agent(records=None, *, files=None, impacts=None, plans=None, max_iterations=5, max_results=100, github_client=None, max_github_files=10):
+def make_agent(records=None, *, files=None, impacts=None, packages=None, github_metadata=None, plans=None, max_iterations=5, max_results=100, github_client=None, max_github_files=10):
     if records is not None:
         impacts = records
     return GraphRAGAgent(
-        driver=FakeDriver({"files": files or [], "impacts": impacts or []}),
+        driver=FakeDriver({
+            "files": files or [],
+            "impacts": impacts or [],
+            "packages": packages or [],
+            "github_metadata": github_metadata or [],
+        }),
         database="neo4j",
         session=FakeAuthorizedSession(plans),
         project="sample-project",
@@ -172,6 +181,8 @@ def test_answer_uses_neo4j_impact_paths_as_vertex_context() -> None:
         }],
     }
     assert agent.driver.neo4j_session.questions == [
+        "repo-a の target の影響範囲は？",
+        "repo-a の target の影響範囲は？",
         "repo-a の target の影響範囲は？",
         "repo-a の target の影響範囲は？",
     ]
@@ -237,6 +248,115 @@ def test_answer_includes_matching_file_as_vertex_context_and_source() -> None:
     assert '"repository": "owner/repo"' in prompt
 
 
+def test_answer_searches_package_relationships_and_fetches_importing_files() -> None:
+    github = FakeGitHubClient({
+        ("owner/api", "src/client.ts"): "import axios from 'axios';",
+    })
+    agent = make_agent(
+        packages=[{
+            "result_type": "package",
+            "package": "axios",
+            "version": "1.6.0",
+            "repository": "owner/api",
+            "dependency_type": "production",
+            "version_spec": "^1.6.0",
+            "dependencies": [{"name": "follow-redirects", "version": "1.15.4"}],
+            "depended_on_by": [],
+            "imported_by": [{"repository": "owner/api", "file": "src/client.ts"}],
+        }],
+        plans=[{"queries": []}],
+        github_client=github,
+    )
+
+    result = agent.answer("owner/api の axios 依存を調べて")
+
+    assert github.requests == [("owner/api", "src/client.ts")]
+    assert result["sources"] == []
+    prompt = agent.session.body["contents"][0]["parts"][0]["text"]
+    assert '"package": "axios"' in prompt
+    assert '"name": "follow-redirects"' in prompt
+    assert "Repositoryからの直接依存" in prompt
+    assert "Package間の推移的依存" in prompt
+    assert "FileからのIMPORTS" in prompt
+
+
+def test_answer_searches_github_user_commit_and_pull_request_history() -> None:
+    agent = make_agent(
+        github_metadata=[{
+            "result_type": "github_metadata",
+            "repository": {"full_name": "owner/api", "name": "api"},
+            "repository_edge": "HAS_COMMIT",
+            "item_type": "Commit",
+            "item": {
+                "oid": "abc123",
+                "messageHeadline": "Add audit logging",
+                "committedDate": "2026-09-01T10:00:00Z",
+            },
+            "author_edge": "AUTHORED",
+            "author": {"id": "octocat", "login": "octocat"},
+            "fixes_edge": None,
+            "fixed_issue": None,
+        }, {
+            "result_type": "github_metadata",
+            "repository": {"full_name": "owner/api", "name": "api"},
+            "repository_edge": "HAS_PULL_REQUEST",
+            "item_type": "PullRequest",
+            "item": {
+                "number": 42,
+                "title": "Add audit logging",
+                "state": "MERGED",
+                "updatedAt": "2026-09-02T10:00:00Z",
+            },
+            "author_edge": "AUTHORED",
+            "author": {"id": "octocat", "login": "octocat"},
+            "fixes_edge": None,
+            "fixed_issue": None,
+        }],
+        plans=[{"queries": []}],
+    )
+
+    result = agent.answer("octocat のコミット履歴とプルリクエスト提出履歴を教えて")
+
+    assert result["sources"] == []
+    prompt = agent.session.body["contents"][0]["parts"][0]["text"]
+    assert '"repository_edge": "HAS_COMMIT"' in prompt
+    assert '"repository_edge": "HAS_PULL_REQUEST"' in prompt
+    assert '"author_edge": "AUTHORED"' in prompt
+    assert "Repository-[:HAS_COMMIT]->Commit" in prompt
+
+
+def test_github_metadata_query_does_not_require_existing_fixes_type() -> None:
+    assert "[fixes_edge:FIXES]" not in GITHUB_METADATA_QUERY
+    assert "type(fixes_edge) = 'FIXES'" in GITHUB_METADATA_QUERY
+
+
+def test_answer_prioritizes_github_history_over_package_results() -> None:
+    agent = make_agent(
+        packages=[{
+            "result_type": "package",
+            "package": "dependency",
+            "repository": "owner/api",
+        }],
+        github_metadata=[{
+            "result_type": "github_metadata",
+            "repository": {"full_name": "owner/api"},
+            "repository_edge": "HAS_PULL_REQUEST",
+            "item_type": "PullRequest",
+            "item": {"number": 42, "title": "Add audit logging"},
+            "author_edge": "AUTHORED",
+            "author": {"login": "octocat"},
+        }],
+        plans=[{"queries": []}],
+        max_results=1,
+    )
+
+    agent.answer("owner/api のプルリクエスト提出履歴を教えて")
+
+    prompt = agent.session.body["contents"][0]["parts"][0]["text"]
+    assert '"repository_edge": "HAS_PULL_REQUEST"' in prompt
+    assert '"package": "dependency"' not in prompt
+
+
 def test_answer_repeats_until_planner_has_no_more_queries() -> None:
     progress = []
     agent = make_agent(
@@ -257,6 +377,10 @@ def test_answer_repeats_until_planner_has_no_more_queries() -> None:
     assert agent.driver.neo4j_session.questions == [
         "target の影響範囲は？",
         "target の影響範囲は？",
+        "target の影響範囲は？",
+        "target の影響範囲は？",
+        "related helper",
+        "related helper",
         "related helper",
         "related helper",
     ]
@@ -264,6 +388,21 @@ def test_answer_repeats_until_planner_has_no_more_queries() -> None:
         "search", "planning", "search", "planning", "answering",
     ]
     assert progress[-1]["iterations"] == 2
+
+
+def test_planner_prompt_describes_package_graph_search() -> None:
+    agent = make_agent(plans=[{"queries": ["axios owner/api"], "github_queries": []}])
+
+    queries, github_queries = agent._next_queries("依存を調べて", [], [], [])
+
+    assert queries == ["axios owner/api"]
+    assert github_queries == []
+    prompt = agent.session.body["contents"][0]["parts"][0]["text"]
+    assert "npm Package名" in prompt
+    assert "Package間の推移的・逆依存" in prompt
+    assert "FileのIMPORTS関係" in prompt
+    assert "GitHubユーザーのlogin・名前・email" in prompt
+    assert "UserのAUTHORED関係" in prompt
 
 
 def test_answer_fetches_graph_files_from_github_for_further_planning() -> None:

@@ -44,6 +44,47 @@ def test_repository_payload_models_files_symbols_and_dependencies() -> None:
     assert payload["fixes"] == [{"commit_id": "owner/demo:commit:abc", "issue_id": "owner/demo:issue:7"}]
 
 
+def test_repository_payload_models_npm_package_relationships() -> None:
+    github_data = {
+        "repository": {"name": "demo", "nameWithOwner": "owner/demo"},
+        "commits": {"items": []}, "pull_requests": {"items": []},
+        "issues": {"items": []}, "contributors": [],
+    }
+    source_data = [{
+        "path": "src/app.ts", "language": "typescript", "classes": [], "functions": [],
+        "imports": ["import axios from 'axios'"], "package_imports": ["axios"],
+    }]
+    manifests = [{
+        "path": "package.json", "type": "package.json", "packages": [], "edges": [],
+        "dependencies": [{
+            "name": "axios", "version": "^1.6.0", "scope": "dependencies",
+            "repository_dependency": None,
+        }],
+    }, {
+        "path": "package-lock.json", "type": "package-lock.json", "dependencies": [],
+        "packages": [{"name": "axios", "version": "1.6.0"}, {"name": "follow-redirects", "version": "1.15.4"}],
+        "edges": [{
+            "source_name": "axios", "source_version": "1.6.0",
+            "target_name": "follow-redirects", "target_version": "1.15.4",
+        }],
+    }]
+
+    payload = repository_payload("owner", github_data, source_data, manifests)
+
+    assert payload["package_dependencies"] == [{
+        "source": "owner/demo", "target": "npm:axios@1.6.0",
+        "type": "production", "version_spec": "^1.6.0",
+    }]
+    assert payload["package_edges"] == [{
+        "source": "npm:axios@1.6.0", "target": "npm:follow-redirects@1.15.4",
+        "repository": "owner/demo",
+    }]
+    assert payload["package_imports"] == [{
+        "source": "owner/demo:src/app.ts", "target": "npm:axios@1.6.0",
+        "name": "axios", "version": "1.6.0",
+    }]
+
+
 def test_repository_is_current_uses_store_fingerprint() -> None:
     class Store:
         def __init__(self) -> None:

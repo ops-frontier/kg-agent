@@ -1,6 +1,6 @@
 from pathlib import Path
 
-from kg_collector.source import analyze_file, analyze_file_isolated, resolve_file_imports
+from kg_collector.source import analyze_file, analyze_file_isolated, npm_package_name, resolve_file_imports
 
 
 def test_analyze_python_symbols_and_calls(tmp_path: Path) -> None:
@@ -57,6 +57,13 @@ def test_resolve_tsx_relative_index_and_alias_imports(tmp_path: Path) -> None:
         "src/components/Dialog.tsx",
         "src/hooks/index.ts",
     ]
+    assert source_data[0]["package_imports"] == ["react"]
+
+
+def test_npm_package_name_handles_scopes_and_subpaths() -> None:
+    assert npm_package_name("axios/lib/adapters") == "axios"
+    assert npm_package_name("@scope/client/http") == "@scope/client"
+    assert npm_package_name("./client") is None
 
 
 def test_analyze_tsx_arrow_function_names(tmp_path: Path) -> None:

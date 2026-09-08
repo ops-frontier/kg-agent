@@ -9,7 +9,7 @@
 1. GitHub GraphQL API で Organization が所有するリポジトリを列挙する。
 2. アーカイブ状態や `--repository` 指定に基づいて対象を絞り込む。
 3. Neo4j の既存 `Repository` ノードと GitHub 上のフィンガープリントを比較する。
-4. 変更されたリポジトリについて、GitHub メタデータ取得、浅い clone、ソース解析、Manifest 解析を行う。
+4. 変更されたリポジトリについて、GitHub メタデータ取得、浅い clone、ソース解析、Manifest・npm lockfile解析を行う。
 5. リポジトリ単位で既存の配下ノードを置き換え、Neo4j にノードとエッジを登録する。
 6. 1件以上を再収集した場合、Organization 内の全 `Function` を使って `CALLS` エッジを再解決する。
 7. 収集結果を `CollectionIndex` ノードへ保存する。
@@ -123,6 +123,8 @@ Function配下を再帰走査し、Callの文字列表現を重複排除・ソ�
 
 Importは`File.imports`プロパティとして保存する。Variableは解析結果には生成するが、現在のグラフモデルには`Variable`ノードもFileプロパティもないためNeo4jへ保存しない。
 
+JavaScript、JSX、TypeScript、TSXでは、import元文字列も抽出する。相対パス、絶対パス、`@/` alias、`#` internal import、およびリポジトリ内ファイルへ解決できたimportを除き、外部npm package名として扱う。subpath importは`axios/lib/adapters`を`axios`、`@scope/client/http`を`@scope/client`へ正規化し、`File -[:IMPORTS]-> Package`を作成する。対象packageがlockfileまたは`package.json`にあればそのversionのPackageへ接続し、複数versionがあれば各versionへ接続する。宣言にもlockfileにもないpackageはversionを`*`として作成する。
+
 ### 言語ごとの実効的な認識
 
 共通ノード型と各grammarのノード名が一致した要素だけを収集する。このため、拡張子が対応表に含まれていても、その言語の全構文を収集できるとは限らない。
@@ -143,7 +145,7 @@ Importは`File.imports`プロパティとして保存する。Variableは解析�
 
 ## 5. Manifestと依存関係の解析
 
-リポジトリ配下を再帰走査し、ファイル名が`package.json`、`pyproject.toml`、`pom.xml`のいずれかであるファイルを解析する。
+リポジトリ配下を再帰走査し、ファイル名が`package.json`、`package-lock.json`、`yarn.lock`、`pnpm-lock.yaml`、`pyproject.toml`、`pom.xml`のいずれかであるファイルを解析する。
 
 ### package.json
 
@@ -155,6 +157,29 @@ Importは`File.imports`プロパティとして保存する。Variableは解析�
 * `optionalDependencies`
 
 `bundledDependencies`、`bundleDependencies`、`overrides`、workspace定義は依存として抽出しない。
+
+各直接依存について、従来の`Manifest -[:DECLARES]-> Dependency`に加えて`Repository -[:DEPENDS_ON]-> Package`を作成する。エッジにはpackage.jsonのversion指定を`version_spec`として保存し、セクションを次の`type`へ変換する。
+
+| package.jsonセクション | `DEPENDS_ON.type` |
+| --- | --- |
+| `dependencies` | `production` |
+| `devDependencies` | `development` |
+| `peerDependencies` | `peer` |
+| `optionalDependencies` | `optional` |
+
+lockfileに同名packageがあれば解決済みversionのPackageへ接続する。同名packageのversionが複数存在する場合は各versionへ接続する。lockfileがない、または同名packageを解決できない場合は、`package.json`のversion指定文字列をPackageのversionとして使用する。
+
+### npm lockfile
+
+次のlockfileから解決済みpackageと推移的・間接依存を抽出し、`Package -[:DEPENDS_ON]-> Package`を作成する。
+
+| lockfile | 解析内容 |
+| --- | --- |
+| `package-lock.json` | `packages`内の`node_modules`エントリ、`dependencies`、`optionalDependencies` |
+| `yarn.lock` | selectorごとの`version`、`dependencies`、`optionalDependencies` |
+| `pnpm-lock.yaml` | `snapshots`または`packages`内のversion、`dependencies`、`optionalDependencies` |
+
+Package間のエッジには収集元の`repository`プロパティを保存する。同じPackage間の依存でも収集元リポジトリごとに別エッジとなる。`link:`、`workspace:`、`file:`で表されるpnpmのローカル参照はPackage間依存にしない。lockfile自体もManifestノードとして保存するが、従来のDependencyノードは作成しない。
 
 ### pyproject.toml
 
@@ -285,6 +310,16 @@ Importは`File.imports`プロパティとして保存する。Variableは解析�
 
 同じManifest、scope、依存名の重複宣言は同じDependencyへ統合される。
 
+### Package
+
+| 項目 | 仕様 |
+| --- | --- |
+| ID | `npm:<name>@<version>` |
+| 収集元 | `package.json`、npm lockfile、JavaScript/TypeScript系ソースのimport |
+| 主なプロパティ | `name`, `version` |
+
+Packageはリポジトリ間で共有する。lockfileから取得できる場合のversionは解決済みversionであり、取得できない直接依存はversion指定文字列、未宣言importは`*`となる。
+
 ### CollectionIndex
 
 | 項目 | 仕様 |
@@ -309,6 +344,9 @@ Importは`File.imports`プロパティとして保存する。Variableは解析�
 | `HAS_MANIFEST` | `Repository -> Manifest` | 検出したManifestごとに作成。解析エラー時も作成 |
 | `DECLARES` | `Manifest -> Dependency` | 正常に解析できた依存宣言ごとに作成 |
 | `DEPENDS_ON` | `Repository -> Repository` | 依存名が同一Organization内のリポジトリ名に一致した場合に作成 |
+| `DEPENDS_ON` | `Repository -> Package` | `package.json`の直接依存ごとに作成。`type`と`version_spec`を保存 |
+| `DEPENDS_ON` | `Package -> Package` | npm lockfileから解決した推移的・間接依存ごとに作成 |
+| `IMPORTS` | `File -> Package` | JavaScript/TypeScript系ソースの外部npm importごとに作成 |
 | `FIXES` | `Commit -> Issue` | Commit見出しが修正キーワードとIssue番号に一致し、そのIssueノードも取得範囲内に存在する場合に作成 |
 
 ### CALLSの解決規則
@@ -368,11 +406,11 @@ build  coverage  dist  node_modules  target  vendor
 
 ### Manifest
 
-Manifest走査の除外ディレクトリは`.git`だけである。ソース解析とは除外規則を共有しないため、`node_modules`、`vendor`、`dist`などに対応名のManifestがあれば解析対象になる。また、`--max-file-bytes`はManifestに適用しない。
+Manifestとnpm lockfile走査の除外ディレクトリは`.git`だけである。ソース解析とは除外規則を共有しないため、`node_modules`、`vendor`、`dist`などに対応名のManifestがあれば解析対象になる。また、`--max-file-bytes`はManifestとlockfileに適用しない。
 
 次の場合はDependencyを作成しない。
 
-* Manifest名が対応する3種類ではない。
+* Manifest名が対応する6種類ではない。
 * JSON、TOML、XMLとして解析できない、または読み込みに失敗した。この場合Manifest自体はerror付きで保存する。
 * 対応Manifest内でも、解析対象外のセクションにだけ依存が記載されている。
 
@@ -384,7 +422,7 @@ Manifest走査の除外ディレクトリは`.git`だけである。ソース解
 * `pushedAt`
 * デフォルトブランチ先頭の`head_oid`
 
-いずれかが違う場合は再収集する。書き込みトランザクション内で、その`repository`プロパティを持つRepository以外の既存ノードを`DETACH DELETE`し、そのRepositoryから出る既存`DEPENDS_ON`を削除してから、新しいノードとエッジを作成する。これにより削除されたソース、履歴範囲から外れたCommit/PR/Issue、削除された依存宣言は残らない。
+いずれかが違う場合は再収集する。書き込みトランザクション内で、その`repository`プロパティを持つRepository以外の既存ノードを`DETACH DELETE`し、そのRepositoryから出る既存`DEPENDS_ON`と、同リポジトリを収集元とするPackage間`DEPENDS_ON`を削除してから、新しいノードとエッジを作成する。参照エッジがなくなったPackageも削除する。これにより削除されたソース、履歴範囲から外れたCommit/PR/Issue、削除された依存宣言は残らない。
 
 Userは`repository`プロパティを持たないため置換時に削除されない。Organizationから削除・移管されたリポジトリを検出してNeo4jから削除する処理もない。`--repository`による部分収集では、選択されなかったリポジトリの直前の収集結果を`CollectionIndex`へ引き継ぐ。
 
@@ -416,6 +454,7 @@ Neo4j接続開始時は2秒間隔で最大30回ready checkを行う。ドライ�
 * Git submoduleの初期化、Git LFSオブジェクトの明示的な取得、ビルド生成は行わない。
 * Commit、Pull Request、Issueは最大100件のサンプルであり、全履歴ではない。
 * TopicとLabelは各30件、Commitに関連するPull Requestは各10件までである。
-* `DEPENDS_ON`は名前のヒューリスティック一致であり、package registryのメタデータやlockfileを参照しない。
-* lockfile、Gradle、Go modules、Cargo、Bundler、Composerなどは現在解析しない。
+* Organization内の`Repository -> Repository`となる`DEPENDS_ON`は名前のヒューリスティック一致であり、package registryのメタデータを参照しない。
+* npm Packageの解決はlockfileの記録だけを使用し、npm registryへの問い合わせ、semver範囲計算、peer dependencyの再解決は行わない。
+* npm以外のlockfile、Gradle、Go modules、Cargo、Bundler、Composerなどは現在解析しない。
 

@@ -35,6 +35,27 @@ def test_analyze_typescript_symbols(tmp_path: Path) -> None:
     assert result["import_modules"] == ["./http"]
 
 
+def test_resolve_package_calls_from_import_and_require(tmp_path: Path) -> None:
+    source = tmp_path / "client.ts"
+    source.write_text(
+        "import shared, { send as sendRequest } from '@example/shared';\n"
+        "const client = require('@example/client');\n"
+        "const { notify: sendNotification } = require('@example/notify');\n"
+        "export function load() { sendRequest(); sendNotification(); return client.fetch(); }\n",
+        encoding="utf-8",
+    )
+
+    result = analyze_file(source, tmp_path, "typescript")
+    resolve_file_imports(tmp_path, [result])
+
+    assert result["package_imports"] == ["@example/shared", "@example/client", "@example/notify"]
+    assert result["functions"][0]["package_calls"] == [
+        {"package": "@example/client", "function": "fetch", "call": "client.fetch"},
+        {"package": "@example/notify", "function": "notify", "call": "sendNotification"},
+        {"package": "@example/shared", "function": "send", "call": "sendRequest"},
+    ]
+
+
 def test_resolve_tsx_relative_index_and_alias_imports(tmp_path: Path) -> None:
     (tmp_path / "src/components").mkdir(parents=True)
     (tmp_path / "src/hooks").mkdir()

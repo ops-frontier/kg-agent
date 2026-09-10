@@ -67,7 +67,7 @@ Web UI はチャット履歴をブラウザのローカルストレージの `kg
 | `GCP_LOCATION` | `us-central1` | Vertex AI のリージョン。`global` の場合はグローバル API エンドポイントを使用する。 |
 | `GCP_MODEL` | `gemini-2.5-flash` | 回答生成と追加検索計画に利用する Vertex AI のモデル名。 |
 | `GRAPHRAG_MAX_OUTPUT_TOKENS` | `8192` | Vertex AI の1回の応答で生成できる最大トークン数。最小値は1。 |
-| `GRAPHRAG_MAX_OUTPUT_CHUNKS` | `3` | 出力上限で回答が終了した場合に、続きを含めて生成する最大チャンク数。最小値は1。JSON形式の検索計画は継続生成しない。 |
+| `GRAPHRAG_MAX_OUTPUT_CHUNKS` | `8` | 出力上限で回答が終了した場合に、続きを含めて生成する最大チャンク数。最小値は1。JSON形式の検索計画は継続生成しない。 |
 
 ### GraphRAG の探索
 
@@ -114,7 +114,7 @@ export GRAPHRAG_MAX_RESULTS=100
 export GRAPHRAG_MAX_GITHUB_FILES=10
 export GRAPHRAG_MAX_GITHUB_FILE_BYTES=200000
 export GRAPHRAG_MAX_OUTPUT_TOKENS=8192
-export GRAPHRAG_MAX_OUTPUT_CHUNKS=3
+export GRAPHRAG_MAX_OUTPUT_CHUNKS=8
 docker compose up --build
 ```
 

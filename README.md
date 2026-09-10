@@ -184,7 +184,7 @@ export GRAPHRAG_MAX_RESULTS=100
 export GRAPHRAG_MAX_GITHUB_FILES=10
 export GRAPHRAG_MAX_GITHUB_FILE_BYTES=200000
 export GRAPHRAG_MAX_OUTPUT_TOKENS=8192
-export GRAPHRAG_MAX_OUTPUT_CHUNKS=3
+export GRAPHRAG_MAX_OUTPUT_CHUNKS=8
 ```
 
 AIチャットは質問を複数の検索語へ分解し、Neo4jで構造を検索する。ソース本文にしかない識別子、文字列、設定キー、エラーメッセージなどを調べる必要がある場合は、`GH_PAT` 認証でGitHub REST APIのCode Searchも実行する。Neo4jまたはCode Searchで見つけたファイルをGitHub Contents APIから取得して内容を調べ、未調査の論点がなくなるまで検索と再計画を繰り返す。探索は `GRAPHRAG_MAX_ITERATIONS` 回、累計 `GRAPHRAG_MAX_RESULTS` 件のいずれかへ到達した時点でも停止する。GitHubから取得するファイルは検索方法を問わず `GRAPHRAG_MAX_GITHUB_FILES` 件まで、各ファイルは `GRAPHRAG_MAX_GITHUB_FILE_BYTES` バイトまでとする。画面には現在の反復回数、検索語、グラフ取得件数、ソース取得件数、回答生成状態を表示する。

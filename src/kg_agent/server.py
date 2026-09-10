@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import select
 import socket
@@ -26,6 +27,8 @@ STATIC_DIR = Path(os.environ.get("STATIC_DIR", Path(__file__).parent / "dist"))
 MAX_CHAT_HISTORY = 20
 MAX_CHAT_MESSAGE_LENGTH = 8_000
 _agent: GraphRAGAgent | None = None
+logging.basicConfig(level=os.environ.get("LOG_LEVEL", "INFO"), format="%(asctime)s %(levelname)s %(message)s")
+LOGGER = logging.getLogger("kg_agent.server")
 
 
 def get_agent() -> GraphRAGAgent:
@@ -157,6 +160,7 @@ class Handler(SimpleHTTPRequestHandler):
             self.send_json({"error": "message を含むJSONを送信してください"}, HTTPStatus.BAD_REQUEST)
             return
         history = normalize_chat_history(payload.get("history"))
+        LOGGER.info("chat request started: message=%r history=%d", message[:200], len(history))
         self.send_response(HTTPStatus.OK)
         self.send_header("Content-Type", "application/x-ndjson; charset=utf-8")
         self.send_header("Cache-Control", "no-cache")
@@ -165,18 +169,37 @@ class Handler(SimpleHTTPRequestHandler):
         self.close_connection = True
 
         def send_event(event: dict[str, Any]) -> None:
-            self.wfile.write((json.dumps(event, ensure_ascii=False) + "\n").encode())
-            self.wfile.flush()
+            try:
+                self.wfile.write((json.dumps(event, ensure_ascii=False) + "\n").encode())
+                self.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError):
+                LOGGER.warning("chat client disconnected while sending %s", event.get("type"), exc_info=True)
+                raise
 
         try:
             result = get_agent().answer(
                 message,
-                lambda progress: send_event({"type": "progress", **progress}),
+                lambda progress: self._send_chat_progress(send_event, progress),
                 history=history,
             )
             send_event({"type": "result", **result})
+            LOGGER.info(
+                "chat request completed: message=%r sources=%d",
+                message[:200],
+                len(result.get("sources", [])),
+            )
+        except (BrokenPipeError, ConnectionResetError):
+            self.close_connection = True
         except Exception as error:
-            send_event({"type": "error", "error": str(error)})
+            LOGGER.exception("chat request failed: message=%r", message[:200])
+            try:
+                send_event({"type": "error", "error": str(error)})
+            except (BrokenPipeError, ConnectionResetError):
+                self.close_connection = True
+
+    def _send_chat_progress(self, send_event: Any, progress: dict[str, Any]) -> None:
+        LOGGER.info("chat progress: %s", json.dumps(progress, ensure_ascii=False, default=str))
+        send_event({"type": "progress", **progress})
 
     def log_message(self, format: str, *args: object) -> None:
         return

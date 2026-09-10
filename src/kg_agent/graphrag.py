@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 import urllib.error
@@ -12,6 +13,9 @@ from urllib.parse import quote, urlencode
 from google.auth.transport.requests import AuthorizedSession
 from google.oauth2 import service_account
 from neo4j import GraphDatabase
+
+
+LOGGER = logging.getLogger("kg_agent.graphrag")
 
 
 IMPACT_QUERY = """
@@ -38,7 +42,11 @@ RETURN target.id AS target_id, target.name AS target_name,
        target.start_line AS target_line, caller.id AS caller_id,
        caller.name AS caller_name, repository.full_name AS caller_repository,
        file.path AS caller_file, caller.start_line AS caller_line,
-       length(impact_path) AS depth
+             length(impact_path) AS depth,
+             any(relationship IN relationships(impact_path)
+                     WHERE type(relationship) = 'CALLS'
+                         AND startNode(relationship).repository <> endNode(relationship).repository
+             ) AS includes_imported_call
 ORDER BY score DESC, depth, caller_repository, caller_file, caller_line
 LIMIT $result_limit
 """
@@ -51,6 +59,9 @@ WHERE size(file_name) >= 2
 OPTIONAL MATCH (file)-[:DEFINES]->(symbol)
 OPTIONAL MATCH (file)-[:IMPORTS]->(imported:File)
 OPTIONAL MATCH (importer:File)-[:IMPORTS]->(file)
+OPTIONAL MATCH function_path = (function_caller:Function)-[:CALLS|REFERENCES*1..5]->(symbol)
+WHERE symbol:Function AND function_caller <> symbol
+OPTIONAL MATCH (caller_repository:Repository)-[:CONTAINS]->(caller_file:File)-[:DEFINES]->(function_caller)
 RETURN 'file' AS result_type, file.id AS file_id, file_name,
              file.path AS file, file.language AS language,
              repository.full_name AS repository,
@@ -60,7 +71,15 @@ RETURN 'file' AS result_type, file.id AS file_id, file_name,
                      line: symbol.start_line
          })[..50] AS definitions,
          collect(DISTINCT imported.path)[..50] AS imports,
-         collect(DISTINCT importer.path)[..50] AS imported_by
+         collect(DISTINCT importer.path)[..50] AS imported_by,
+         [caller IN collect(DISTINCT {
+             repository: caller_repository.full_name,
+             file: caller_file.path,
+             function: function_caller.name,
+             line: function_caller.start_line,
+             target_function: symbol.name,
+             depth: length(function_path)
+         }) WHERE caller.function IS NOT NULL][..50] AS function_callers
 ORDER BY repository, file.path
 LIMIT $result_limit
 """
@@ -130,7 +149,7 @@ DEFAULT_MAX_RESULTS = 100
 DEFAULT_MAX_GITHUB_FILES = 10
 DEFAULT_MAX_GITHUB_FILE_BYTES = 200_000
 DEFAULT_MAX_OUTPUT_TOKENS = 8192
-DEFAULT_MAX_OUTPUT_CHUNKS = 3
+DEFAULT_MAX_OUTPUT_CHUNKS = 8
 MAX_QUERIES_PER_ITERATION = 5
 GITHUB_HISTORY_PATTERN = re.compile(
     r"コミット|プル\s*リク|イシュー|履歴|提出|"
@@ -381,6 +400,7 @@ class GraphRAGAgent:
                         try:
                             content = self.github_client.fetch(repository, path)
                         except (OSError, ValueError, urllib.error.HTTPError, urllib.error.URLError):
+                            LOGGER.exception("github file fetch failed: repository=%s path=%s", repository, path)
                             failures += 1
                             continue
                         file_context.append({
@@ -404,6 +424,7 @@ class GraphRAGAgent:
                 try:
                     matches = self.github_client.search(github_query, remaining_files)
                 except (OSError, ValueError, json.JSONDecodeError, urllib.error.HTTPError, urllib.error.URLError):
+                    LOGGER.exception("github code search failed: query=%s", github_query)
                     continue
                 candidates = [item for item in matches if item not in fetched_files][
                     :remaining_files
@@ -424,6 +445,7 @@ class GraphRAGAgent:
                     try:
                         content = self.github_client.fetch(repository, path)
                     except (OSError, ValueError, urllib.error.HTTPError, urllib.error.URLError):
+                        LOGGER.exception("github file fetch failed: repository=%s path=%s", repository, path)
                         failures += 1
                         continue
                     file_context.append({
@@ -474,6 +496,10 @@ class GraphRAGAgent:
             "以下のNeo4j検索結果とGitHubから取得したソースコードだけを根拠として質問に日本語で回答してください。"
             "質問へ直接回答し、該当するリポジトリ、ファイル、関数などを明記してください。"
             "変更影響の質問では、変更対象、直接影響、間接影響、呼び出し距離を分けてください。"
+            "ファイル変更の影響は imported_by だけで判断せず、definitions と function_callers も使って、"
+            "そのファイル内の関数を呼び出す関数・ファイルを影響範囲に含めてください。"
+            "includes_imported_call が true の経路は、依存パッケージを import/require して"
+            "跨リポジトリで呼び出している影響として、経由するリポジトリと関数を含めて列挙してください。"
             "Packageの質問では、Repositoryからの直接依存、Package間の推移的依存、"
             "FileからのIMPORTSをNeo4j検索結果から区別して説明してください。"
             "GitHub履歴の質問では、Repository-[:HAS_COMMIT]->Commit、"
@@ -500,6 +526,11 @@ class GraphRAGAgent:
             pairs.extend(
                 (item.get("repository"), item.get("file"))
                 for item in record.get("imported_by", [])
+                if isinstance(item, dict)
+            )
+            pairs.extend(
+                (item.get("repository"), item.get("file"))
+                for item in record.get("function_callers", [])
                 if isinstance(item, dict)
             )
             for repository, path in pairs:
@@ -572,6 +603,23 @@ class GraphRAGAgent:
                     line=None,
                     depth=0,
                 ))
+                for caller in record.get("function_callers", []):
+                    if not isinstance(caller, dict):
+                        continue
+                    caller_key = (
+                        caller.get("repository"), caller.get("file"),
+                        caller.get("function"), caller.get("line"), caller.get("depth"),
+                    )
+                    if caller_key in seen:
+                        continue
+                    seen.add(caller_key)
+                    sources.append(GraphSource(
+                        repository=caller.get("repository") or "",
+                        file=caller.get("file") or "",
+                        function=caller.get("function") or "",
+                        line=caller.get("line"),
+                        depth=caller.get("depth") or 0,
+                    ))
                 continue
             if not record.get("caller_id"):
                 continue
@@ -654,6 +702,7 @@ class GraphRAGAgent:
             generation_config["responseMimeType"] = response_mime_type
         contents = [{"role": "user", "parts": [{"text": prompt}]}]
         chunks = []
+        finish_reason = ""
         for _ in range(self.max_output_chunks):
             response = self.session.post(
                 url,
@@ -679,10 +728,23 @@ class GraphRAGAgent:
             except (KeyError, IndexError, TypeError) as error:
                 raise RuntimeError("Vertex AI API から回答本文が返されませんでした") from error
             chunks.append(text)
-            if candidate.get("finishReason") != "MAX_TOKENS" or response_mime_type:
+            finish_reason = str(candidate.get("finishReason") or "")
+            if finish_reason not in {"MAX_TOKENS", "MAX_OUTPUT_TOKENS"} or response_mime_type:
                 break
             contents.extend([
                 {"role": "model", "parts": [{"text": text}]},
                 {"role": "user", "parts": [{"text": "直前の回答の続きだけを、重複せず最後まで出力してください。"}]},
             ])
-        return "".join(chunks).strip()
+        message = "".join(chunks).strip()
+        if finish_reason in {"MAX_TOKENS", "MAX_OUTPUT_TOKENS"} and not response_mime_type:
+            LOGGER.warning(
+                "vertex output continuation exhausted: chunks=%d max_output_tokens=%d",
+                self.max_output_chunks,
+                self.max_output_tokens,
+            )
+            message = (
+                f"{message}\n\n"
+                "※ 回答が長いため、設定された続きを取得する上限に達しました。"
+                "GRAPHRAG_MAX_OUTPUT_CHUNKS または GRAPHRAG_MAX_OUTPUT_TOKENS を増やして再実行してください。"
+            )
+        return message

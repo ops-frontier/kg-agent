@@ -40,7 +40,9 @@ def test_repository_payload_models_files_symbols_and_dependencies() -> None:
         "target": "owner/demo:src/api/client.py",
     }]
     assert payload["functions"][0]["calls"] == ["send"]
-    assert payload["repository_dependencies"] == [{"source": "owner/demo", "target": "owner/lib"}]
+    assert payload["repository_dependencies"] == [{
+        "source": "owner/demo", "target": "owner/lib", "package": "lib",
+    }]
     assert payload["fixes"] == [{"commit_id": "owner/demo:commit:abc", "issue_id": "owner/demo:issue:7"}]
 
 
@@ -114,7 +116,10 @@ def test_repository_fingerprint_uses_dynamic_schema_version_property() -> None:
         def run(self, query, **parameters):
             assert "r.source_schema_version" not in query
             assert "r[$source_schema_version_key]" in query
+            assert "r.head_oid" not in query
+            assert "r[$head_oid_key]" in query
             assert parameters["source_schema_version_key"] == "source_schema_version"
+            assert parameters["head_oid_key"] == "head_oid"
             return Result()
 
     assert _repository_fingerprint_tx(Transaction(), "owner/repository") is None
@@ -168,3 +173,25 @@ def test_call_edges_are_grouped_by_source_repository() -> None:
     assert resolutions["owner/a"]["reference_edges"] == [
         {"source": "owner/a:a.py:1:run", "target": "owner/b:b.py:1:shared"},
     ]
+
+
+def test_package_call_edges_target_the_declared_repository() -> None:
+    functions = [
+        {
+            "id": "owner/app:app.ts:1:run", "owner": "owner", "repository": "owner/app",
+            "file": "app.ts", "name": "run", "calls": ["send"], "references": [],
+            "package_calls": [{"call": "send", "function": "send", "repository": "owner/shared"}],
+            "external": False,
+        },
+        {
+            "id": "owner/shared:api.ts:1:send", "owner": "owner", "repository": "owner/shared",
+            "file": "api.ts", "name": "send", "calls": [], "references": [], "external": False,
+        },
+    ]
+
+    resolutions = call_edge_resolutions("owner", functions)
+
+    assert resolutions["owner/app"]["edges"] == [{
+        "source": "owner/app:app.ts:1:run", "target": "owner/shared:api.ts:1:send",
+    }]
+    assert resolutions["owner/app"]["external_nodes"] == {}

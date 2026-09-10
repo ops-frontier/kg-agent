@@ -1,6 +1,6 @@
 import pytest
 
-from kg_agent.graphrag import GITHUB_METADATA_QUERY, GitHubFileClient, GraphRAGAgent
+from kg_agent.graphrag import IMPACT_QUERY, GITHUB_METADATA_QUERY, GitHubFileClient, GraphRAGAgent
 
 
 class FakeNeo4jSession:
@@ -190,6 +190,22 @@ def test_answer_uses_neo4j_impact_paths_as_vertex_context() -> None:
     assert agent.session.url.startswith("https://asia-northeast1-aiplatform.googleapis.com/v1/")
 
 
+def test_impact_query_and_prompt_identify_imported_call_paths() -> None:
+    agent = make_agent(impacts=[{
+        "target_id": "shared:send", "target_name": "send",
+        "target_repository": "owner/shared", "caller_id": "app:run",
+        "caller_name": "run", "caller_repository": "owner/app",
+        "caller_file": "src/app.ts", "caller_line": 4, "depth": 1,
+        "includes_imported_call": True,
+    }])
+
+    agent.answer("shared の send を変更した場合の影響範囲は？")
+
+    assert "includes_imported_call" in IMPACT_QUERY
+    assert "import/require" in agent.session.body["contents"][0]["parts"][0]["text"]
+    assert '"includes_imported_call": true' in agent.session.body["contents"][0]["parts"][0]["text"]
+
+
 def test_answer_keeps_target_context_when_no_callers_exist() -> None:
     records = [{
         "target_id": "repo-a:target",
@@ -246,6 +262,45 @@ def test_answer_includes_matching_file_as_vertex_context_and_source() -> None:
     prompt = agent.session.body["contents"][0]["parts"][0]["text"]
     assert '"file_name": "SearchSection.tsx"' in prompt
     assert '"repository": "owner/repo"' in prompt
+
+
+def test_file_impact_includes_callers_of_defined_functions() -> None:
+    github = FakeGitHubClient({
+        ("owner/shared", "src/changeStream.ts"): "export function open() {}",
+        ("owner/app", "src/useChangeStream.ts"): "import { open } from '@owner/change-stream';",
+    })
+    agent = make_agent(
+        files=[{
+            "result_type": "file",
+            "file_id": "owner/shared:src/changeStream.ts",
+            "file_name": "changeStream.ts",
+            "file": "src/changeStream.ts",
+            "language": "typescript",
+            "repository": "owner/shared",
+            "definitions": [{"type": "Function", "name": "open", "line": 12}],
+            "imported_by": [],
+            "function_callers": [{
+                "repository": "owner/app", "file": "src/useChangeStream.ts",
+                "function": "start", "line": 8, "target_function": "open", "depth": 1,
+            }],
+        }],
+        plans=[{"queries": []}],
+        github_client=github,
+    )
+
+    result = agent.answer("changeStream.ts を変更した際の影響範囲を教えてください")
+
+    assert result["sources"] == [
+        {"repository": "owner/shared", "file": "src/changeStream.ts", "function": "", "line": None, "depth": 0},
+        {"repository": "owner/app", "file": "src/useChangeStream.ts", "function": "start", "line": 8, "depth": 1},
+    ]
+    assert github.requests == [
+        ("owner/shared", "src/changeStream.ts"),
+        ("owner/app", "src/useChangeStream.ts"),
+    ]
+    prompt = agent.session.body["contents"][0]["parts"][0]["text"]
+    assert "function_callers" in prompt
+    assert "imported_by だけで判断せず" in prompt
 
 
 def test_answer_searches_package_relationships_and_fetches_importing_files() -> None:
@@ -541,3 +596,27 @@ def test_generate_continues_after_max_tokens() -> None:
         "role": "model",
         "parts": [{"text": "回答の前半。"}],
     }
+
+
+def test_generate_marks_answer_when_continuation_limit_is_exhausted(caplog) -> None:
+    session = ChunkedSession([
+        ChunkResponse("回答の前半。", "MAX_TOKENS"),
+        ChunkResponse("回答の続き。", "MAX_TOKENS"),
+    ])
+    agent = GraphRAGAgent(
+        driver=FakeDriver({}),
+        database="neo4j",
+        session=session,
+        project="sample-project",
+        location="global",
+        model="gemini-2.5-flash",
+        max_output_tokens=128,
+        max_output_chunks=2,
+    )
+
+    result = agent._generate("質問")
+
+    assert result.startswith("回答の前半。回答の続き。")
+    assert "続きを取得する上限に達しました" in result
+    assert "vertex output continuation exhausted" in caplog.text
+    assert len(session.requests) == 2

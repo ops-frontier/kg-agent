@@ -41,7 +41,7 @@ VARIABLE_TYPES = {
 }
 CALL_TYPES = {"call", "call_expression", "invocation_expression"}
 PARSER_LOCK = Lock()
-SOURCE_SCHEMA_VERSION = 4
+SOURCE_SCHEMA_VERSION = 5
 MODULE_EXTENSIONS = (".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs")
 
 
@@ -106,6 +106,14 @@ def _analyze_file(path: Path, root: Path, language: str) -> dict[str, Any]:
             if name_node is not None:
                 variables.append({"name": node_text(name_node, source, 200), "line": node.start_point.row + 1})
 
+    import_bindings = (
+        javascript_import_bindings(source.decode("utf-8", errors="replace"))
+        if language in {"javascript", "typescript", "tsx"} else []
+    )
+    import_modules = list(dict.fromkeys([
+        *import_modules,
+        *(binding["module"] for binding in import_bindings),
+    ]))
     return {
         "schema_version": SOURCE_SCHEMA_VERSION,
         "path": path.relative_to(root).as_posix(),
@@ -116,6 +124,7 @@ def _analyze_file(path: Path, root: Path, language: str) -> dict[str, Any]:
         "variables": variables,
         "imports": imports,
         "import_modules": import_modules,
+        "import_bindings": import_bindings,
     }
 
 
@@ -135,6 +144,64 @@ def resolve_file_imports(root: Path, source_data: list[dict[str, Any]]) -> None:
             if resolve_module_path(item["path"], module, known_paths, configs) is None
             if (package_name := npm_package_name(module)) is not None
         ))
+        package_modules = {
+            module for module in item.get("import_modules", [])
+            if resolve_module_path(item["path"], module, known_paths, configs) is None
+            and npm_package_name(module) is not None
+        }
+        bindings = {
+            binding["local"]: binding
+            for binding in item.get("import_bindings", [])
+            if binding["module"] in package_modules
+        }
+        for function in item.get("functions", []):
+            package_calls = []
+            for call in function.get("calls", []):
+                local_name, _, member = call.partition(".")
+                binding = bindings.get(local_name)
+                if binding is None:
+                    continue
+                package_calls.append({
+                    "package": npm_package_name(binding["module"]),
+                    "function": member or binding["imported"],
+                    "call": call,
+                })
+            function["package_calls"] = list({
+                tuple(sorted(package_call.items())): package_call
+                for package_call in package_calls
+            }.values())
+
+
+def javascript_import_bindings(source: str) -> list[dict[str, str]]:
+    bindings = []
+    patterns = [
+        r"\bimport\s+(.+?)\s+from\s+[\"']([^\"']+)[\"']",
+        r"\b(?:const|let|var)\s+(.+?)\s*=\s*require\(\s*[\"']([^\"']+)[\"']\s*\)",
+    ]
+    for pattern in patterns:
+        for match in re.finditer(pattern, source, flags=re.DOTALL):
+            specifier, module = match.groups()
+            bindings.extend(_javascript_binding_specifiers(specifier.strip(), module))
+    return list({tuple(sorted(binding.items())): binding for binding in bindings}.values())
+
+
+def _javascript_binding_specifiers(specifier: str, module: str) -> list[dict[str, str]]:
+    if "," in specifier and "{" in specifier:
+        default, named = specifier.split(",", 1)
+        return _javascript_binding_specifiers(default, module) + _javascript_binding_specifiers(named.strip(), module)
+    if specifier.startswith("{") and specifier.endswith("}"):
+        result = []
+        for item in specifier[1:-1].split(","):
+            imported, separator, local = item.strip().partition(" as ")
+            if not separator:
+                imported, _, local = imported.partition(":")
+            if imported:
+                result.append({"module": module, "local": (local or imported).strip(), "imported": imported.strip()})
+        return result
+    if specifier.startswith("*"):
+        _, _, local = specifier.partition(" as ")
+        return [{"module": module, "local": local.strip(), "imported": "*"}] if local.strip() else []
+    return [{"module": module, "local": specifier.split(",", 1)[0].strip(), "imported": "default"}]
 
 
 def npm_package_name(module: str) -> str | None:

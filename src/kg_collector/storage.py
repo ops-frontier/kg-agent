@@ -292,7 +292,7 @@ def repository_payload(
         "files": file_payloads(full_name, source_data),
         "file_imports": file_import_payloads(full_name, source_data),
         "package_imports": package_import_payloads(full_name, source_data, packages),
-        "functions": function_payloads(full_name, owner, source_data),
+        "functions": function_payloads(full_name, owner, source_data, manifests),
         "classes": class_payloads(full_name, owner, source_data),
         "commits": commit_payloads(full_name, owner, github_data["commits"]["items"]),
         "pull_requests": pull_request_payloads(full_name, owner, github_data["pull_requests"]["items"]),
@@ -355,10 +355,26 @@ def package_import_payloads(
     ]
 
 
-def function_payloads(repository: str, owner: str, source_data: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def function_payloads(
+    repository: str,
+    owner: str,
+    source_data: list[dict[str, Any]],
+    manifests: Iterable[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    package_repositories = {
+        dependency["name"]: f"{owner}/{dependency['repository_dependency']}"
+        for manifest in manifests
+        for dependency in manifest["dependencies"]
+        if dependency.get("repository_dependency")
+    }
     result = []
     for item in source_data:
         for function in item["functions"]:
+            package_calls = [
+                {**package_call, "repository": package_repositories[package_call["package"]]}
+                for package_call in function.get("package_calls", [])
+                if package_call["package"] in package_repositories
+            ]
             result.append({
                 **clean_properties(function),
                 "id": symbol_id(repository, item["path"], function),
@@ -366,6 +382,7 @@ def function_payloads(repository: str, owner: str, source_data: list[dict[str, A
                 "repository": repository,
                 "file": item["path"],
                 "calls": function.get("calls", []),
+                "package_calls_json": json.dumps(package_calls, ensure_ascii=False),
             })
     return result
 
@@ -478,6 +495,7 @@ def repository_dependency_payloads(repository: str, owner: str, manifests: Itera
                 result.append({
                     "source": repository,
                     "target": f"{owner}/{dependency['repository_dependency']}",
+                    "package": dependency["name"],
                 })
     return result
 
@@ -576,10 +594,11 @@ def _repository_fingerprint_tx(tx: Any, full_name: str) -> Any:
     return tx.run(
         """
         MATCH (r:Repository {full_name: $full_name})
-         RETURN r.updatedAt AS updatedAt, r.pushedAt AS pushedAt, r.head_oid AS head_oid,
+         RETURN r.updatedAt AS updatedAt, r.pushedAt AS pushedAt, r[$head_oid_key] AS head_oid,
              r[$source_schema_version_key] AS source_schema_version
         """,
         full_name=full_name,
+        head_oid_key="head_oid",
         source_schema_version_key="source_schema_version",
     ).single()
 
@@ -602,11 +621,17 @@ def _read_functions_tx(tx: Any, owner: str) -> list[dict[str, Any]]:
         MATCH (fn:Function {owner: $owner})
         RETURN fn.id AS id, fn.repository AS repository, fn.file AS file,
              fn.name AS name, fn.calls AS calls, fn.references AS references,
+               fn.package_calls_json AS package_calls_json,
              coalesce(fn.external, false) AS external
         """,
         owner=owner,
     )
-    return [dict(record) for record in records]
+    functions = []
+    for record in records:
+        function = dict(record)
+        function["package_calls"] = json.loads(function.pop("package_calls_json") or "[]")
+        functions.append(function)
+    return functions
 
 
 def _write_collection_index_tx(tx: Any, owner: str, index: dict[str, Any]) -> None:
@@ -784,7 +809,8 @@ def _write_repository_tx(tx: Any, payload: dict[str, Any]) -> None:
         MATCH (source:Repository {full_name: item.source})
         MERGE (target:Repository {full_name: item.target})
         SET target.owner = $owner, target.repository = item.target
-        MERGE (source)-[:DEPENDS_ON]->(target)
+        MERGE (source)-[dependency:DEPENDS_ON]->(target)
+        SET dependency.package = item.package
         """,
         owner=repository["owner"],
         repository_dependencies=payload["repository_dependencies"],
@@ -827,16 +853,30 @@ def call_edge_resolutions(
     internal = [function for function in functions if not function["external"]]
     by_name: dict[str, list[str]] = {}
     by_file_and_name: dict[tuple[str, str, str], list[str]] = {}
+    by_repository_and_name: dict[tuple[str, str], list[str]] = {}
     for function in internal:
         by_name.setdefault(function["name"], []).append(function["id"])
         by_file_and_name.setdefault((function["repository"], function["file"], function["name"]), []).append(function["id"])
+        by_repository_and_name.setdefault((function["repository"], function["name"]), []).append(function["id"])
     result: dict[str, dict[str, Any]] = {}
     for function in internal:
         resolution = result.setdefault(
             function["repository"],
             {"external_nodes": {}, "edges": [], "reference_edges": []},
         )
+        resolved_package_calls = set()
+        for package_call in function.get("package_calls") or []:
+            target_name = package_call.get("function", "").rsplit(".", 1)[-1]
+            target_ids = by_repository_and_name.get(
+                (package_call.get("repository", ""), target_name),
+                [],
+            )
+            if len(target_ids) == 1:
+                resolution["edges"].append({"source": function["id"], "target": target_ids[0]})
+                resolved_package_calls.add(package_call.get("call"))
         for called_name in function.get("calls") or []:
+            if called_name in resolved_package_calls:
+                continue
             local_targets = by_file_and_name.get((function["repository"], function["file"], called_name), [])
             global_targets = by_name.get(called_name, [])
             if local_targets:

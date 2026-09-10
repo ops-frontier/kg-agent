@@ -1,5 +1,6 @@
 import http.client
 import json
+import logging
 import threading
 from functools import partial
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -57,6 +58,33 @@ def test_chat_returns_graphrag_response(monkeypatch, tmp_path) -> None:
             "message": "呼び出し元が影響を受けます",
             "sources": [{"function": "caller"}],
         }]
+    finally:
+        connection.close()
+        server.shutdown()
+        server.server_close()
+
+
+def test_chat_logs_graphrag_failures(monkeypatch, tmp_path, caplog) -> None:
+    class StubAgent:
+        def answer(self, question, progress, history):
+            progress({"stage": "search", "iteration": 1})
+            raise RuntimeError("Neo4j query timed out")
+
+    monkeypatch.setattr(agent_server, "get_agent", lambda: StubAgent())
+    caplog.set_level(logging.INFO, logger="kg_agent.server")
+    server = start_server(tmp_path)
+    connection = http.client.HTTPConnection(*server.server_address)
+    try:
+        body = json.dumps({"message": "changeStream.ts の影響範囲は？"})
+        connection.request("POST", "/api/chat", body, {"Content-Type": "application/json"})
+        response = connection.getresponse()
+        events = [json.loads(line) for line in response.readlines()]
+
+        assert response.status == 200
+        assert events[-1] == {"type": "error", "error": "Neo4j query timed out"}
+        assert "chat request failed" in caplog.text
+        assert "Neo4j query timed out" in caplog.text
+        assert "chat progress" in caplog.text
     finally:
         connection.close()
         server.shutdown()
